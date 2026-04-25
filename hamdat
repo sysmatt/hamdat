@@ -7,6 +7,7 @@ Supports incremental daily updates, callsign lookup, name/address search,
 and radius-based ZIP code queries with table, CSV, JSON, and HTML output.
 
 Author : Matt Hoskins, K2TTA  <k2tta@arrl.net>
+GitHub : https://github.com/sysmatt/hamdat
 Data   : https://www.fcc.gov/uls/transactions/daily-weekly.html
 """
 
@@ -984,7 +985,8 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "hamdat - FCC Amateur Radio License Database\n"
-            "Author: Matt Hoskins, K2TTA  <k2tta@arrl.net>"
+            "Author: Matt Hoskins, K2TTA  <k2tta@arrl.net>\n"
+            "GitHub: https://github.com/sysmatt/hamdat"
         ),
         epilog="Data: https://www.fcc.gov/uls/transactions/daily-weekly.html",
         formatter_class=argparse.RawDescriptionHelpFormatter,

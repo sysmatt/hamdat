@@ -1,6 +1,7 @@
 # hamdat
 
-**Author:** Matt Hoskins, K2TTA — k2tta@arrl.net
+**Author:** Matt Hoskins, K2TTA — k2tta@arrl.net  
+**GitHub:** https://github.com/sysmatt/hamdat
 
 A command-line utility for downloading, caching, and querying FCC Amateur Radio license data from the [ULS (Universal Licensing System)](https://www.fcc.gov/uls/transactions/daily-weekly.html) bulk data files.
 
