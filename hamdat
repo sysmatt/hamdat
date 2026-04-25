@@ -902,7 +902,44 @@ def search_address(query, regex=False, fmt="table", outfile=None, db_path=None):
     _output_results(results, _SEARCH_FIELDS, fmt, outfile)
 
 
-def pull(db_path=None, cache_dir=None, force=False):
+def _load_full_zip(source_zip, conn):
+    """Drop all data tables, recreate schema, and load from source_zip. Returns record count."""
+    cur = conn.cursor()
+    for _filename, (table, _cols) in FILE_SCHEMAS.items():
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+    conn.commit()
+    _create_schema(conn)
+
+    total = 0
+    with zipfile.ZipFile(source_zip) as zf:
+        available = {info.filename for info in zf.infolist()}
+        missing = [f for f in FILE_SCHEMAS if f not in available]
+        if missing:
+            print(f"  Note: archive does not contain: {', '.join(missing)}")
+        for filename, (table, columns) in FILE_SCHEMAS.items():
+            total += _load_dat(zf, filename, table, columns, conn,
+                               or_ignore=(table == "history"))
+    return total
+
+
+def _pull_daily_local(conn, folder):
+    """Apply daily update zips found in folder, in day-of-week order."""
+    print(f"\nChecking local daily update files in {folder} ...")
+    found = [(day, folder / f"l_am_{day}.zip") for day in DAILY_DAYS
+             if (folder / f"l_am_{day}.zip").exists()]
+    if not found:
+        print("  No daily update files found.")
+        return
+    print(f"  Found {len(found)} file(s): {', '.join(d for d, _ in found)}")
+    for day, path in found:
+        print(f"  [{day}] applying {path.name} ...")
+        with zipfile.ZipFile(path) as zf:
+            n_records, n_usids = _apply_daily_zip(zf, conn)
+        print(f"  [{day}] {n_records:,} records, {n_usids:,} licenses updated")
+        conn.commit()
+
+
+def pull(db_path=None, cache_dir=None, force=False, zips_folder=None):
     global CACHE_DIR, DB_PATH, CACHE_ZIP, ETAG_FILE
 
     if cache_dir:
@@ -914,72 +951,77 @@ def pull(db_path=None, cache_dir=None, force=False):
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # --- Check weekly snapshot ---
-    print("Checking weekly snapshot ...")
-    remote_etag, snapshot_dt = _remote_meta(FCC_AMAT_URL)
-    if remote_etag is None and not CACHE_ZIP.exists():
-        sys.exit("Cannot reach FCC servers and no cached data available. Check network.")
-
-    print(f"  Remote last-modified : {_fmt_dt(snapshot_dt)}")
-    print(f"  Remote ETag          : {remote_etag or '(none)'}")
-
-    cached_etag = ETAG_FILE.read_text().strip() if (ETAG_FILE.exists() and CACHE_ZIP.exists()) else ""
-    print(f"  Cached ETag          : {cached_etag or '(none)'}")
-
-    full_changed = force or not remote_etag or not cached_etag or remote_etag != cached_etag
-
-    if full_changed:
-        if force:
-            print("  → --force specified; re-downloading full dataset")
-        elif not remote_etag:
-            print("  → could not read remote ETag; re-downloading to be safe")
-        elif not cached_etag:
-            print("  → no cached copy found; downloading full dataset")
-        else:
-            print("  → ETag changed; downloading updated full dataset")
-        _download(FCC_AMAT_URL, CACHE_ZIP)
-        if remote_etag:
-            ETAG_FILE.write_text(remote_etag)
-    else:
-        print("  → ETag unchanged; full dataset is current, skipping download")
-
-    # --- Open / initialise database ---
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
 
-    if full_changed:
+    if zips_folder:
+        # --- Local folder mode: skip all HTTP, load directly from disk ---
+        folder     = Path(zips_folder)
+        source_zip = folder / "l_amat.zip"
+        if not source_zip.exists():
+            sys.exit(f"Weekly snapshot not found in --zips-folder: {source_zip}")
+
+        print(f"Loading from local folder: {folder}")
+        print(f"  Weekly snapshot : {source_zip}")
         print(f"\nLoading into {DB_PATH}")
-        cur = conn.cursor()
-        for _filename, (table, _cols) in FILE_SCHEMAS.items():
-            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
-        conn.commit()
-
-        _create_schema(conn)
-
-        total = 0
-        with zipfile.ZipFile(CACHE_ZIP) as zf:
-            available = {info.filename for info in zf.infolist()}
-            missing = [f for f in FILE_SCHEMAS if f not in available]
-            if missing:
-                print(f"  Note: archive does not contain: {', '.join(missing)}")
-            for filename, (table, columns) in FILE_SCHEMAS.items():
-                total += _load_dat(zf, filename, table, columns, conn,
-                                   or_ignore=(table == "history"))
+        total = _load_full_zip(source_zip, conn)
 
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("DELETE FROM _daily_applied")
         conn.execute("INSERT OR REPLACE INTO _meta VALUES (?, ?)", ("last_pull", now))
-        if snapshot_dt:
-            conn.execute("INSERT OR REPLACE INTO _meta VALUES (?, ?)",
-                         ("snapshot_date", snapshot_dt.isoformat()))
         conn.commit()
         print(f"\nDone. {total:,} total records loaded into {DB_PATH}")
-    else:
-        _create_schema(conn)  # Ensures new tables/indexes exist on schema upgrades
 
-    # --- Apply daily incremental updates ---
-    _pull_daily(conn, force=force)
+        _pull_daily_local(conn, folder)
+
+    else:
+        # --- Remote mode: ETag check, download if changed, apply daily updates ---
+        print("Checking weekly snapshot ...")
+        remote_etag, snapshot_dt = _remote_meta(FCC_AMAT_URL)
+        if remote_etag is None and not CACHE_ZIP.exists():
+            sys.exit("Cannot reach FCC servers and no cached data available. Check network.")
+
+        print(f"  Remote last-modified : {_fmt_dt(snapshot_dt)}")
+        print(f"  Remote ETag          : {remote_etag or '(none)'}")
+
+        cached_etag = ETAG_FILE.read_text().strip() if (ETAG_FILE.exists() and CACHE_ZIP.exists()) else ""
+        print(f"  Cached ETag          : {cached_etag or '(none)'}")
+
+        full_changed = force or not remote_etag or not cached_etag or remote_etag != cached_etag
+
+        if full_changed:
+            if force:
+                print("  → --force specified; re-downloading full dataset")
+            elif not remote_etag:
+                print("  → could not read remote ETag; re-downloading to be safe")
+            elif not cached_etag:
+                print("  → no cached copy found; downloading full dataset")
+            else:
+                print("  → ETag changed; downloading updated full dataset")
+            _download(FCC_AMAT_URL, CACHE_ZIP)
+            if remote_etag:
+                ETAG_FILE.write_text(remote_etag)
+        else:
+            print("  → ETag unchanged; full dataset is current, skipping download")
+
+        if full_changed:
+            print(f"\nLoading into {DB_PATH}")
+            total = _load_full_zip(CACHE_ZIP, conn)
+
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute("DELETE FROM _daily_applied")
+            conn.execute("INSERT OR REPLACE INTO _meta VALUES (?, ?)", ("last_pull", now))
+            if snapshot_dt:
+                conn.execute("INSERT OR REPLACE INTO _meta VALUES (?, ?)",
+                             ("snapshot_date", snapshot_dt.isoformat()))
+            conn.commit()
+            print(f"\nDone. {total:,} total records loaded into {DB_PATH}")
+        else:
+            _create_schema(conn)  # Ensures new tables/indexes exist on schema upgrades
+
+        _pull_daily(conn, force=force)
+
     conn.close()
 
 
@@ -1002,6 +1044,11 @@ def main():
     parser.add_argument(
         "--force", action="store_true",
         help="Force re-download even if cached data appears current",
+    )
+    parser.add_argument(
+        "--zips-folder", metavar="DIR",
+        help="Load FCC zip files from a local folder instead of downloading "
+             "(expects l_amat.zip; optional l_am_sun.zip … l_am_sat.zip for daily updates)",
     )
 
     # --- Queries ---
@@ -1070,7 +1117,8 @@ def main():
     fmt  = args.fmt
 
     if args.pull:
-        pull(db_path=args.db, cache_dir=args.cache_dir, force=args.force)
+        pull(db_path=args.db, cache_dir=args.cache_dir, force=args.force,
+             zips_folder=args.zips_folder)
     elif args.zip:
         find_radius(args.zip, distance_miles=args.radius_miles,
                     fmt=fmt, outfile=args.file, db_path=args.db)

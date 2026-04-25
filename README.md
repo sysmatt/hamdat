@@ -44,6 +44,7 @@ hamdat [--pull] [--force] [--call CALLSIGN] [--zip ZIPCODE] [--name QUERY] [--ad
 |---|---|
 | `--pull` | Download FCC data and load into the local SQLite database |
 | `--force` | Force re-download of the full dataset even if the cached copy is current |
+| `--zips-folder DIR` | Load FCC zip files from a local folder instead of downloading |
 
 **Queries**
 
@@ -134,6 +135,14 @@ hamdat --pull
 ```
 
 Running this daily (e.g. via cron) keeps the database within 24 hours of the FCC's live data.
+
+### Load from a local folder
+
+```
+hamdat --pull --zips-folder /path/to/downloaded/zips/
+```
+
+Skips all HTTP activity and reads directly from local files. The folder must contain `l_amat.zip` (the weekly snapshot). Any daily files present (`l_am_sun.zip` … `l_am_sat.zip`) are applied automatically in day-of-week order after the full load. Useful for offline environments, pre-staged files, or testing.
 
 ### Force a full reload
 
