@@ -1,0 +1,1084 @@
+#!/usr/bin/env python3
+"""
+hamdat - FCC Amateur Radio License Database Utility
+
+Downloads, caches, and queries FCC ULS amateur radio license data.
+Supports incremental daily updates, callsign lookup, name/address search,
+and radius-based ZIP code queries with table, CSV, JSON, and HTML output.
+
+Author : Matt Hoskins, K2TTA  <k2tta@arrl.net>
+Data   : https://www.fcc.gov/uls/transactions/daily-weekly.html
+"""
+
+import argparse
+import csv
+import io
+import json
+import re
+import sqlite3
+import sys
+import zipfile
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from math import atan2, cos, isnan, radians, sin, sqrt
+from pathlib import Path
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Install requests: pip install requests")
+
+# FCC ULS full amateur radio database (weekly snapshot)
+# Directory: https://data.fcc.gov/download/pub/uls/complete/
+FCC_AMAT_URL = "https://data.fcc.gov/download/pub/uls/complete/l_amat.zip"
+
+CACHE_DIR = Path.home() / ".hamdat"
+DB_PATH = CACHE_DIR / "hamdat.db"
+CACHE_ZIP = CACHE_DIR / "l_amat.zip"
+ETAG_FILE = CACHE_DIR / "l_amat.etag"
+BATCH_SIZE = 10_000
+
+# FCC ULS daily change files (one per day-of-week, rolling/overwritten each week)
+# Directory: https://data.fcc.gov/download/pub/uls/daily/
+FCC_DAILY_URL = "https://data.fcc.gov/download/pub/uls/daily/l_am_{day}.zip"
+DAILY_DAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
+
+# Column definitions per FCC ULS data dictionary
+# Files are pipe-delimited with no header rows; may have trailing pipe
+FILE_SCHEMAS = {
+    "HD.dat": ("license_header", [
+        "record_type", "unique_system_identifier", "uls_file_number", "ebf_number",
+        "call_sign", "license_status", "radio_service_code", "grant_date",
+        "expired_date", "cancellation_date", "eligibility_rule_num", "reserved_1",
+        "alien", "alien_government", "alien_corporation", "alien_officer",
+        "alien_control", "revoked", "convicted", "adjudged", "reserved_2",
+        "common_carrier", "non_common_carrier", "private_comm", "fixed",
+        "mobile", "radiolocation", "satellite", "developmental_sta",
+        "interconnected_voip", "certifier_first_name", "certifier_mi",
+        "certifier_last_name", "certifier_suffix", "certifier_title",
+        "female", "black_or_african_american", "native_american", "hawaiian",
+        "asian", "white", "hispanic", "effective_date", "last_action_date",
+        "auction_id", "reg_stat_broad", "band_manager", "type_of_operation",
+        "linked_unique_system_identifier", "linked_call_sign",
+        "vanity_tag_reg_num", "related_cid", "former_licensee_name",
+        "pending_app_reason", "registry_identity_code",
+    ]),
+    "EN.dat": ("entity", [
+        "record_type", "unique_system_identifier", "uls_file_number", "ebf_number",
+        "call_sign", "entity_type", "licensee_id", "entity_name",
+        "first_name", "mi", "last_name", "suffix", "phone", "fax", "email",
+        "street_address", "city", "state", "zip_code", "po_box",
+        "attention_line", "sgin", "frn", "applicant_type_code",
+        "applicant_type_code_other", "status_code", "status_date",
+        "ghz37_license",
+    ]),
+    "AM.dat": ("amateur", [
+        "record_type", "unique_system_identifier", "uls_file_number", "ebf_number",
+        "call_sign", "operator_class", "group_code", "region_code",
+        "club_type_code", "club_member_code", "club_name", "rule_waiver",
+        "new_applicant_code", "sequential_applicant_code", "former_club_member_code",
+        "date_first_licensed", "license_type_code", "linked_call_sign",
+        "linked_unique_system_identifier", "license_type", "status_code", "status_date",
+    ]),
+    "HS.dat": ("history", [
+        "record_type", "unique_system_identifier", "uls_file_number",
+        "call_sign", "log_date", "code",
+    ]),
+    "CO.dat": ("comments", [
+        "record_type", "unique_system_identifier", "uls_file_number",
+        "call_sign", "comment_date", "description", "status_code", "status_date",
+    ]),
+    "SC.dat": ("special_condition", [
+        "record_type", "unique_system_identifier", "uls_file_number",
+        "ebf_number", "call_sign", "special_condition_type",
+        "special_condition_code", "status_code", "status_date",
+    ]),
+    "SF.dat": ("license_free_form_special_condition", [
+        "record_type", "unique_system_identifier", "uls_file_number",
+        "ebf_number", "call_sign", "unique_ff_seq_id", "condition_type",
+        "if_condition_code", "if_condition_text", "status_code", "status_date",
+    ]),
+    "LA.dat": ("license_attachment", [
+        "record_type", "unique_system_identifier", "call_sign",
+        "attachment_code", "attachment_desc", "attachment_date",
+        "attachment_file_name", "action_performed",
+    ]),
+}
+
+
+def _fmt_dt(dt):
+    """Format a datetime for display, or 'unknown' if None."""
+    if dt is None:
+        return "unknown"
+    return dt.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _remote_meta(url):
+    """HEAD request → (etag, last_modified_dt). Returns (None, None) on failure."""
+    try:
+        resp = requests.head(url, timeout=15)
+        resp.raise_for_status()
+        etag = resp.headers.get("ETag") or None
+        lm = None
+        lm_str = resp.headers.get("Last-Modified", "")
+        if lm_str:
+            try:
+                lm = parsedate_to_datetime(lm_str)
+            except Exception:
+                pass
+        return etag, lm
+    except requests.RequestException:
+        return None, None
+
+
+def _download(url, dest):
+    print(f"Downloading {url}")
+    resp = requests.get(url, stream=True, timeout=60)
+    resp.raise_for_status()
+    total = int(resp.headers.get("content-length", 0))
+    received = 0
+    with open(dest, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=65536):
+            f.write(chunk)
+            received += len(chunk)
+            if total:
+                pct = received * 100 // total
+                print(f"\r  {pct:3d}%  {received / 1_048_576:.1f} MB", end="", flush=True)
+    print(f"\r  100%  {received / 1_048_576:.1f} MB")
+
+
+def _create_schema(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS _meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS _daily_applied (
+            day        TEXT PRIMARY KEY,
+            etag       TEXT,
+            applied_at TEXT
+        )
+    """)
+    for _filename, (table, columns) in FILE_SCHEMAS.items():
+        col_defs = ",\n  ".join(f'"{col}" TEXT' for col in columns)
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS "{table}" (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                {col_defs}
+            )
+        """)
+
+    indexes = [
+        ("idx_hd_call",  "license_header", "call_sign"),
+        ("idx_hd_usi",   "license_header", "unique_system_identifier"),
+        ("idx_en_call",  "entity",         "call_sign"),
+        ("idx_en_usi",   "entity",         "unique_system_identifier"),
+        ("idx_am_call",  "amateur",        "call_sign"),
+        ("idx_am_usi",   "amateur",        "unique_system_identifier"),
+        ("idx_am_class", "amateur",        "operator_class"),
+    ]
+    for name, table, col in indexes:
+        conn.execute(f'CREATE INDEX IF NOT EXISTS {name} ON "{table}"("{col}")')
+
+    # Unique index on history prevents duplicate entries when daily files are re-applied
+    try:
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_hs_dedup
+            ON history(unique_system_identifier, call_sign, log_date, code)
+        """)
+    except sqlite3.IntegrityError:
+        pass  # Pre-existing duplicates; INSERT OR IGNORE still helps going forward
+
+    conn.commit()
+
+
+def _load_dat(zf, filename, table, columns, conn):
+    try:
+        info = zf.getinfo(filename)
+    except KeyError:
+        print(f"  {filename}: not in archive, skipping")
+        return 0
+
+    n_cols = len(columns)
+    placeholders = ",".join("?" * n_cols)
+    col_names = ",".join(f'"{c}"' for c in columns)
+    sql = f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders})'
+
+    cur = conn.cursor()
+    batch = []
+    count = 0
+
+    print(f"  {filename} -> {table} ...", end="", flush=True)
+    with zf.open(info) as raw:
+        for line in io.TextIOWrapper(raw, encoding="latin-1", errors="replace"):
+            line = line.rstrip("\r\n")
+            if not line:
+                continue
+            parts = line.split("|")
+            # Drop trailing empty element from trailing pipe
+            if parts and parts[-1] == "":
+                parts = parts[:-1]
+            # Normalize to expected column count
+            if len(parts) < n_cols:
+                parts.extend([""] * (n_cols - len(parts)))
+            else:
+                parts = parts[:n_cols]
+            batch.append(parts)
+            if len(batch) >= BATCH_SIZE:
+                cur.executemany(sql, batch)
+                count += len(batch)
+                batch = []
+
+    if batch:
+        cur.executemany(sql, batch)
+        count += len(batch)
+
+    conn.commit()
+    print(f" {count:,} records")
+    return count
+
+
+def _parse_dat_in_memory(zf, filename, columns):
+    """Parse a pipe-delimited .dat from an open ZipFile into a list of row lists."""
+    try:
+        info = zf.getinfo(filename)
+    except KeyError:
+        return []
+    n_cols = len(columns)
+    records = []
+    with zf.open(info) as raw:
+        for line in io.TextIOWrapper(raw, encoding="latin-1", errors="replace"):
+            line = line.rstrip("\r\n")
+            if not line:
+                continue
+            parts = line.split("|")
+            if parts and parts[-1] == "":
+                parts = parts[:-1]
+            if len(parts) < n_cols:
+                parts.extend([""] * (n_cols - len(parts)))
+            else:
+                parts = parts[:n_cols]
+            records.append(parts)
+    return records
+
+
+def _apply_daily_zip(zf, conn):
+    """Apply one daily change zip to the DB. Returns (n_records, n_usids_changed)."""
+    HISTORY_TABLE = "history"
+
+    # Parse all .dat files into memory (daily zips are small, ~MB range)
+    all_records = {}
+    for filename, (table, columns) in FILE_SCHEMAS.items():
+        recs = _parse_dat_in_memory(zf, filename, columns)
+        if recs:
+            all_records[table] = (columns, recs)
+
+    # Collect USIDs touched in mutable tables so we can replace their rows cleanly
+    changed_usids = set()
+    for table, (columns, recs) in all_records.items():
+        if table == HISTORY_TABLE:
+            continue
+        usid_idx = columns.index("unique_system_identifier")
+        for rec in recs:
+            u = rec[usid_idx]
+            if u:
+                changed_usids.add(u)
+
+    # Delete stale rows for affected USIDs from every mutable table
+    if changed_usids:
+        mutable_tables = list(dict.fromkeys(
+            t for _, (t, _) in FILE_SCHEMAS.items() if t != HISTORY_TABLE
+        ))
+        usid_list = list(changed_usids)
+        for table in mutable_tables:
+            for i in range(0, len(usid_list), BATCH_SIZE):
+                batch = usid_list[i:i + BATCH_SIZE]
+                ph = ",".join("?" * len(batch))
+                conn.execute(
+                    f'DELETE FROM "{table}" WHERE unique_system_identifier IN ({ph})',
+                    batch,
+                )
+
+    # Insert updated records; history uses INSERT OR IGNORE (unique index prevents duplicates)
+    n_records = 0
+    for table, (columns, recs) in all_records.items():
+        col_names = ",".join(f'"{c}"' for c in columns)
+        ph = ",".join("?" * len(columns))
+        if table == HISTORY_TABLE:
+            sql = f'INSERT OR IGNORE INTO "{table}" ({col_names}) VALUES ({ph})'
+        else:
+            sql = f'INSERT INTO "{table}" ({col_names}) VALUES ({ph})'
+        for i in range(0, len(recs), BATCH_SIZE):
+            conn.executemany(sql, recs[i:i + BATCH_SIZE])
+        n_records += len(recs)
+
+    conn.commit()
+    return n_records, len(changed_usids)
+
+
+def _pull_daily(conn, force=False):
+    """Check all 7 FCC daily change files and apply any that are newer than the DB snapshot."""
+    # Snapshot date: when the weekly full file was last generated (from its Last-Modified header)
+    row = conn.execute("SELECT value FROM _meta WHERE key = 'snapshot_date'").fetchone()
+    snapshot_dt = None
+    if row and row[0]:
+        try:
+            snapshot_dt = datetime.fromisoformat(row[0])
+        except ValueError:
+            pass
+
+    # Load already-applied ETags so we don't re-apply the same file twice
+    applied_etags = {}
+    applied_dates = {}
+    for r in conn.execute("SELECT day, etag, applied_at FROM _daily_applied").fetchall():
+        applied_etags[r[0]] = r[1]
+        applied_dates[r[0]] = r[2]
+
+    print(f"\nChecking daily updates (snapshot baseline: {_fmt_dt(snapshot_dt)})")
+
+    # HEAD all 7 daily files; collect candidates that are new / unprocessed
+    _DT_MAX = datetime.max.replace(tzinfo=timezone.utc)
+    candidates = []
+    for day in DAILY_DAYS:
+        url = FCC_DAILY_URL.format(day=day)
+        etag, lm = _remote_meta(url)
+
+        lm_str = _fmt_dt(lm)
+
+        if etag is None and lm is None:
+            print(f"  {day:>3}:  {lm_str}  → unreachable")
+            continue
+
+        # Already applied this exact version?
+        if not force and etag and applied_etags.get(day) == etag:
+            applied_at = applied_dates.get(day, "")
+            print(f"  {day:>3}:  {lm_str}  → already applied ({applied_at[:16] if applied_at else '?'})")
+            continue
+
+        # Older than or same age as the weekly snapshot — data already included
+        if snapshot_dt and lm and lm <= snapshot_dt:
+            print(f"  {day:>3}:  {lm_str}  → predates snapshot, skipping")
+            continue
+
+        print(f"  {day:>3}:  {lm_str}  → will apply")
+        candidates.append((lm or _DT_MAX, day, url, etag))
+
+    if not candidates:
+        print("  All daily files are current.")
+        return
+
+    # Apply in Last-Modified chronological order so older deltas come first
+    candidates.sort()
+    print(f"\nApplying {len(candidates)} daily update(s):")
+
+    for _lm, day, url, remote_etag in candidates:
+        cache_zip = CACHE_DIR / f"l_am_{day}.zip"
+        _download(url, cache_zip)
+        with zipfile.ZipFile(cache_zip) as zf:
+            n_records, n_usids = _apply_daily_zip(zf, conn)
+        print(f"  [{day}] {n_records:,} records, {n_usids:,} licenses updated")
+        conn.execute(
+            "INSERT OR REPLACE INTO _daily_applied (day, etag, applied_at) VALUES (?, ?, ?)",
+            (day, remote_etag or "", datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+
+
+# FCC code → human-readable decode tables
+_CLASS_NAMES = {
+    "E": "Amateur Extra",
+    "A": "Advanced",
+    "G": "General",
+    "T": "Technician",
+    "N": "Novice",
+    "P": "Technician Plus",
+}
+
+_STATUS_NAMES = {
+    "A": "Active",
+    "C": "Canceled",
+    "E": "Expired",
+    "T": "Terminated",
+    "L": "Pending Legal Status",
+}
+
+_HISTORY_CODES = {
+    "LIAG": "Issued — After Grant",
+    "LIRN": "Issued — After Renewal",
+    "LCAN": "Canceled",
+    "LEXP": "Expired",
+    "LINM": "Issued — After Name Change",
+    "LADR": "Issued — After Address Change",
+    "LMOD": "Modified",
+    "LNEW": "New License Issued",
+    "LREN": "Renewal",
+    "LVNT": "Vanity Call Sign Issued",
+    "LRST": "Reinstated",
+}
+
+# Field lists for tabular search results
+_SEARCH_FIELDS = [
+    "call_sign", "name", "operator_class",
+    "address", "city", "state", "zip_code",
+    "grant_date", "expired_date", "effective_date", "last_action",
+]
+_RADIUS_FIELDS = [
+    "call_sign", "distance_miles", "name", "operator_class",
+    "address", "city", "state", "zip_code",
+    "grant_date", "expired_date", "effective_date", "last_action",
+]
+
+# Shared SELECT used by find_radius, search_name, search_address
+_SQL_OPERATOR = """
+    SELECT h.unique_system_identifier, h.call_sign,
+           h.grant_date, h.expired_date, h.effective_date, h.last_action_date,
+           e.first_name, e.mi, e.last_name, e.entity_name,
+           e.street_address, e.po_box, e.city, e.state,
+           SUBSTR(TRIM(e.zip_code), 1, 5) AS zip5,
+           e.email, a.operator_class
+    FROM license_header h
+    JOIN entity e ON e.unique_system_identifier = h.unique_system_identifier
+         AND (e.entity_type = 'L' OR e.entity_type = '')
+    LEFT JOIN amateur a ON a.unique_system_identifier = h.unique_system_identifier
+    WHERE h.license_status = 'A'
+"""
+
+_W = 78  # display width
+
+
+def _hr(char="─"):
+    return " " + char * (_W - 1)
+
+
+def _field(label, value, lw=16):
+    v = str(value).strip() if value else ""
+    if not v:
+        return None
+    return f"  {label:<{lw}}  {v}"
+
+
+def _display_call(call, hd, en, am, history):
+    status_code = ((hd["license_status"] if hd else "") or "").strip()
+    status_str = _STATUS_NAMES.get(status_code, status_code or "Unknown")
+
+    class_code = ((am["operator_class"] if am else "") or "").strip()
+    class_str = _CLASS_NAMES.get(class_code, class_code)
+
+    name = ""
+    if en:
+        if en["first_name"] or en["last_name"]:
+            name = " ".join(
+                p.strip() for p in [en["first_name"], en["mi"], en["last_name"], en["suffix"]] if p
+            )
+        elif en["entity_name"]:
+            name = en["entity_name"].strip()
+
+    status_tag = f"[ {status_str.upper()} ]"
+
+    print()
+    print("=" * _W)
+    line1 = f"  {call}"
+    print(line1 + status_tag.rjust(_W - len(line1)))
+    if name or class_str:
+        line2 = f"  {name}"
+        suffix = class_str.rjust(_W - len(line2)) if class_str else ""
+        print(line2 + suffix)
+    print("=" * _W)
+
+    # OPERATOR
+    rows = []
+    if class_code:
+        rows.append(_field("Class", f"{class_str}  ({class_code})"))
+    if am:
+        rows.append(_field("First Licensed", am["date_first_licensed"]))
+        rows.append(_field("Group", am["group_code"]))
+        rows.append(_field("Region", am["region_code"]))
+        if am["club_name"] and am["club_name"].strip():
+            rows.append(_field("Club", am["club_name"]))
+    if en:
+        rows.append(_field("FRN", en["frn"]))
+    rows = [r for r in rows if r]
+    if rows:
+        print()
+        print("  OPERATOR")
+        print(_hr())
+        print("\n".join(rows))
+
+    # LICENSE
+    rows = []
+    if hd:
+        rows.append(_field("Granted", hd["grant_date"]))
+        rows.append(_field("Expires", hd["expired_date"]))
+        if hd["cancellation_date"] and hd["cancellation_date"].strip():
+            rows.append(_field("Canceled", hd["cancellation_date"]))
+        rows.append(_field("Effective", hd["effective_date"]))
+        rows.append(_field("Last Action", hd["last_action_date"]))
+        rows.append(_field("Service Code", hd["radio_service_code"]))
+        rows.append(_field("USID", hd["unique_system_identifier"]))
+        rows.append(_field("ULS File #", hd["uls_file_number"]))
+    rows = [r for r in rows if r]
+    if rows:
+        print()
+        print("  LICENSE")
+        print(_hr())
+        print("\n".join(rows))
+
+    # CONTACT
+    rows = []
+    if en:
+        addr1 = (en["street_address"] or "").strip() or (en["po_box"] or "").strip()
+        city_state = ", ".join(p for p in [en["city"], en["state"]] if p and p.strip())
+        zip_code = (en["zip_code"] or "").strip()
+        addr2 = f"{city_state}  {zip_code}".strip() if zip_code else city_state
+        if addr1:
+            rows.append(_field("Address", addr1))
+            if addr2:
+                rows.append(_field("", addr2))
+        elif addr2:
+            rows.append(_field("Address", addr2))
+        rows.append(_field("Phone", en["phone"]))
+        rows.append(_field("Email", en["email"]))
+    rows = [r for r in rows if r]
+    if rows:
+        print()
+        print("  CONTACT")
+        print(_hr())
+        print("\n".join(rows))
+
+    # HISTORY
+    if history:
+        print()
+        print("  HISTORY  (most recent)")
+        print(_hr())
+        for h in history:
+            code = (h["code"] or "").strip()
+            desc = _HISTORY_CODES.get(code, code)
+            date = (h["log_date"] or "").strip()
+            print(f"  {date:<12}  {code:<8}  {desc}")
+
+    print()
+    print("=" * _W)
+    print()
+
+
+def _row_to_result(row):
+    """Convert a joined sqlite3.Row (header + entity + amateur) to a standard result dict."""
+    row_keys = row.keys()
+    zc = (row["zip5"] if "zip5" in row_keys else (row["zip_code"] or ""))[:5]
+    name = " ".join(
+        p for p in [row["first_name"], row["mi"], row["last_name"]] if p
+    ).strip() or (row["entity_name"] or "").strip()
+    street  = (row["street_address"] or row["po_box"] or "").strip()
+    city_st = ", ".join(p for p in [row["city"], row["state"]] if p and (p or "").strip())
+    address = "  ".join(p for p in [street, city_st, zc] if p)
+    return {
+        "call_sign":      (row["call_sign"]      or "").strip(),
+        "name":           name,
+        "operator_class": _CLASS_NAMES.get(row["operator_class"] or "", row["operator_class"] or ""),
+        "address":        address,
+        "city":           (row["city"]            or "").strip(),
+        "state":          (row["state"]           or "").strip(),
+        "zip_code":       zc,
+        "email":          (row["email"]           or "").strip(),
+        "grant_date":     (row["grant_date"]      or "").strip(),
+        "expired_date":   (row["expired_date"]    or "").strip(),
+        "effective_date": (row["effective_date"]  or "").strip(),
+        "last_action":    (row["last_action_date"] or "").strip(),
+    }
+
+
+# Per-column max display widths for table output; values longer than this are truncated
+_TABLE_COL_MAX = {
+    "call_sign": 10, "name": 24, "operator_class": 14, "distance_miles": 9,
+    "address": 36, "city": 14, "state": 5, "zip_code": 7,
+    "email": 28, "grant_date": 10, "expired_date": 10, "effective_date": 10, "last_action": 10,
+}
+
+
+def _trunc(s, width):
+    s = "" if s is None else str(s)
+    return s if len(s) <= width else s[:width - 1] + "…"
+
+
+def _write_table(results, fieldnames):
+    if not results:
+        print("No results.")
+        return
+    widths = {}
+    for f in fieldnames:
+        cap      = _TABLE_COL_MAX.get(f, 24)
+        data_max = max((len("" if r.get(f) is None else str(r.get(f))) for r in results), default=0)
+        widths[f] = max(len(f), min(data_max, cap))
+    header = "  ".join(f.upper().ljust(widths[f]) for f in fieldnames)
+    sep    = "  ".join("─" * widths[f] for f in fieldnames)
+    print(header)
+    print(sep)
+    for r in results:
+        print("  ".join(_trunc(r.get(f, ""), widths[f]).ljust(widths[f]) for f in fieldnames))
+    print(f"\n{len(results):,} result(s)")
+
+
+def _write_csv(results, fieldnames, outfile):
+    with open(outfile, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(results)
+    print(f"{len(results):,} result(s) written to {outfile}")
+
+
+def _write_json(results, fieldnames, outfile):
+    out = [{f: r.get(f, "") for f in fieldnames} for r in results]
+    with open(outfile, "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"{len(results):,} result(s) written to {outfile}")
+
+
+def _write_html(results, fieldnames, outfile):
+    def esc(s):
+        return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    lines = [
+        "<!DOCTYPE html>",
+        '<html><head><meta charset="utf-8">',
+        "<style>",
+        "body{font-family:sans-serif;font-size:13px}",
+        "table{border-collapse:collapse;width:100%}",
+        "th{background:#2c3e50;color:#fff;padding:6px 10px;text-align:left;white-space:nowrap}",
+        "td{padding:5px 10px;border-bottom:1px solid #ddd;white-space:nowrap}",
+        "tr:nth-child(even){background:#f9f9f9}",
+        "tr:hover{background:#eef3f8}",
+        "</style>",
+        "<title>hamdat results</title></head>",
+        "<body>",
+        f"<p><strong>{len(results):,} result(s)</strong> &mdash; "
+        f"generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</p>",
+        "<table><thead><tr>",
+        *[f"  <th>{esc(f)}</th>" for f in fieldnames],
+        "</tr></thead><tbody>",
+    ]
+    for r in results:
+        lines.append("<tr>")
+        lines.extend(f"  <td>{esc(r.get(f, ''))}</td>" for f in fieldnames)
+        lines.append("</tr>")
+    lines += ["</tbody></table></body></html>"]
+    with open(outfile, "w") as f:
+        f.write("\n".join(lines))
+    print(f"{len(results):,} result(s) written to {outfile}")
+
+
+def _output_results(results, fieldnames, fmt, outfile):
+    """Dispatch a result list to the chosen output format."""
+    if fmt == "table":
+        _write_table(results, fieldnames)
+    elif fmt == "csv":
+        _write_csv(results, fieldnames, outfile or CACHE_DIR / "results.csv")
+    elif fmt == "json":
+        _write_json(results, fieldnames, outfile or CACHE_DIR / "results.json")
+    elif fmt == "html":
+        _write_html(results, fieldnames, outfile or CACHE_DIR / "results.html")
+
+
+def lookup(callsign, db_path=None):
+    db = Path(db_path or DB_PATH)
+    if not db.exists():
+        sys.exit(f"Database not found: {db}\nRun --pull first.")
+
+    call = callsign.strip().upper()
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+
+    hd = conn.execute(
+        "SELECT * FROM license_header WHERE call_sign = ? ORDER BY id DESC LIMIT 1",
+        (call,),
+    ).fetchone()
+
+    # Anchor entity and amateur lookups to the current license's USID so we
+    # don't pick up records from a previous holder of the same callsign.
+    usid = hd["unique_system_identifier"] if hd else None
+
+    if usid:
+        en = conn.execute(
+            """SELECT * FROM entity WHERE unique_system_identifier = ?
+               ORDER BY CASE WHEN entity_type = 'L' THEN 0 ELSE 1 END, id
+               LIMIT 1""",
+            (usid,),
+        ).fetchone()
+        am = conn.execute(
+            "SELECT * FROM amateur WHERE unique_system_identifier = ? ORDER BY id DESC LIMIT 1",
+            (usid,),
+        ).fetchone()
+    else:
+        en = None
+        am = None
+
+    if not any([hd, en, am]):
+        print(f"No record found for callsign: {call}")
+        conn.close()
+        return
+
+    history = conn.execute(
+        "SELECT * FROM history WHERE call_sign = ? ORDER BY log_date DESC LIMIT 10",
+        (call,),
+    ).fetchall()
+
+    conn.close()
+    _display_call(call, hd, en, am, history)
+
+
+def _haversine_miles(lat1, lon1, lat2, lon2):
+    R = 3958.8
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+
+def find_radius(zipcode, distance_miles=0, fmt="table", outfile=None, db_path=None):
+    try:
+        import pgeocode
+    except ImportError:
+        sys.exit("Install pgeocode: pip install pgeocode")
+
+    db = Path(db_path or DB_PATH)
+    if not db.exists():
+        sys.exit(f"Database not found: {db}\nRun --pull first.")
+
+    ref_zip = zipcode.strip().zfill(5)
+    nomi    = pgeocode.Nominatim("us")
+    ref     = nomi.query_postal_code(ref_zip)
+    try:
+        ref_lat = float(ref.latitude)
+        ref_lon = float(ref.longitude)
+        if isnan(ref_lat) or isnan(ref_lon):
+            raise ValueError
+    except (TypeError, ValueError):
+        sys.exit(f"Could not find coordinates for zip code: {ref_zip}")
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+
+    # Step 1: collect all unique 5-digit zip codes from active licenses
+    print("Collecting zip codes ...", end="", flush=True)
+    zip_rows = conn.execute("""
+        SELECT DISTINCT SUBSTR(TRIM(e.zip_code), 1, 5) AS zip5
+        FROM license_header h
+        JOIN entity e ON e.unique_system_identifier = h.unique_system_identifier
+        WHERE h.license_status = 'A'
+          AND e.zip_code IS NOT NULL AND e.zip_code != ''
+    """).fetchall()
+    all_zips = [r["zip5"] for r in zip_rows if r["zip5"] and len(r["zip5"]) >= 4]
+    print(f" {len(all_zips):,} unique zip codes")
+
+    # Step 2: batch geocode with pgeocode and filter to radius (all in-memory, instant)
+    print("Filtering by distance ...", end="", flush=True)
+    geo_df    = nomi.query_postal_code(all_zips)
+    in_radius = {}  # zip5 -> distance_miles
+    for i, zc in enumerate(all_zips):
+        try:
+            lat = float(geo_df.iloc[i]["latitude"])
+            lon = float(geo_df.iloc[i]["longitude"])
+            if isnan(lat) or isnan(lon):
+                continue
+            d = _haversine_miles(ref_lat, ref_lon, lat, lon)
+            if d <= distance_miles:
+                in_radius[zc] = round(d, 2)
+        except (TypeError, ValueError):
+            pass
+    print(f" {len(in_radius):,} zip codes within {distance_miles} miles")
+
+    if not in_radius:
+        conn.close()
+        print("No operators found.")
+        return
+
+    # Step 3: fetch operators whose zip falls in the radius
+    placeholders = ",".join("?" * len(in_radius))
+    rows = conn.execute(
+        _SQL_OPERATOR + f"  AND SUBSTR(TRIM(e.zip_code), 1, 5) IN ({placeholders})",
+        list(in_radius),
+    ).fetchall()
+    conn.close()
+
+    seen    = set()
+    results = []
+    for row in rows:
+        usid = row["unique_system_identifier"]
+        if usid in seen:
+            continue
+        seen.add(usid)
+        result = _row_to_result(row)
+        result["distance_miles"] = in_radius.get(result["zip_code"], "")
+        results.append(result)
+
+    results.sort(key=lambda r: (r["distance_miles"], r["call_sign"]))
+    print(f"Found {len(results):,} operators within {distance_miles} miles of {ref_zip} (distances approximate)")
+    _output_results(results, _RADIUS_FIELDS, fmt, outfile)
+
+
+def _register_regexp(conn):
+    conn.create_function("REGEXP", 2,
+        lambda pat, s: bool(re.search(pat, s or "", re.IGNORECASE)))
+
+
+def search_name(query, regex=False, fmt="table", outfile=None, db_path=None):
+    db = Path(db_path or DB_PATH)
+    if not db.exists():
+        sys.exit(f"Database not found: {db}\nRun --pull first.")
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+
+    name_expr = (
+        "COALESCE(e.first_name,'') || ' ' || COALESCE(e.mi,'') || ' ' || COALESCE(e.last_name,'')"
+    )
+    if regex:
+        _register_regexp(conn)
+        cond   = f"({name_expr} REGEXP ? OR COALESCE(e.entity_name,'') REGEXP ?)"
+        params = [query, query]
+    else:
+        like   = f"%{query}%"
+        cond   = f"({name_expr} LIKE ? OR COALESCE(e.entity_name,'') LIKE ?)"
+        params = [like, like]
+
+    rows = conn.execute(_SQL_OPERATOR + f"  AND {cond}", params).fetchall()
+    conn.close()
+
+    seen    = set()
+    results = []
+    for row in rows:
+        usid = row["unique_system_identifier"]
+        if usid in seen:
+            continue
+        seen.add(usid)
+        results.append(_row_to_result(row))
+    results.sort(key=lambda r: r["name"].lower())
+
+    mode = "regex" if regex else "substring"
+    print(f"Name search ({mode}): '{query}'  —  {len(results):,} result(s)")
+    _output_results(results, _SEARCH_FIELDS, fmt, outfile)
+
+
+def search_address(query, regex=False, fmt="table", outfile=None, db_path=None):
+    db = Path(db_path or DB_PATH)
+    if not db.exists():
+        sys.exit(f"Database not found: {db}\nRun --pull first.")
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+
+    addr_cols = [
+        "COALESCE(e.street_address,'')",
+        "COALESCE(e.po_box,'')",
+        "COALESCE(e.city,'')",
+        "COALESCE(e.state,'')",
+        "SUBSTR(TRIM(e.zip_code),1,5)",
+    ]
+    if regex:
+        _register_regexp(conn)
+        cond   = "(" + " OR ".join(f"{c} REGEXP ?" for c in addr_cols) + ")"
+        params = [query] * len(addr_cols)
+    else:
+        like   = f"%{query}%"
+        cond   = "(" + " OR ".join(f"{c} LIKE ?" for c in addr_cols) + ")"
+        params = [like] * len(addr_cols)
+
+    rows = conn.execute(_SQL_OPERATOR + f"  AND {cond}", params).fetchall()
+    conn.close()
+
+    seen    = set()
+    results = []
+    for row in rows:
+        usid = row["unique_system_identifier"]
+        if usid in seen:
+            continue
+        seen.add(usid)
+        results.append(_row_to_result(row))
+    results.sort(key=lambda r: (r["state"], r["city"], r["name"].lower()))
+
+    mode = "regex" if regex else "substring"
+    print(f"Address search ({mode}): '{query}'  —  {len(results):,} result(s)")
+    _output_results(results, _SEARCH_FIELDS, fmt, outfile)
+
+
+def pull(db_path=None, cache_dir=None, force=False):
+    global CACHE_DIR, DB_PATH, CACHE_ZIP, ETAG_FILE
+
+    if cache_dir:
+        CACHE_DIR = Path(cache_dir)
+        CACHE_ZIP = CACHE_DIR / "l_amat.zip"
+        ETAG_FILE = CACHE_DIR / "l_amat.etag"
+    if db_path:
+        DB_PATH = Path(db_path)
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # --- Check weekly snapshot ---
+    print("Checking weekly snapshot ...")
+    remote_etag, snapshot_dt = _remote_meta(FCC_AMAT_URL)
+    if remote_etag is None and not CACHE_ZIP.exists():
+        sys.exit("Cannot reach FCC servers and no cached data available. Check network.")
+
+    print(f"  Remote last-modified : {_fmt_dt(snapshot_dt)}")
+    print(f"  Remote ETag          : {remote_etag or '(none)'}")
+
+    cached_etag = ETAG_FILE.read_text().strip() if (ETAG_FILE.exists() and CACHE_ZIP.exists()) else ""
+    print(f"  Cached ETag          : {cached_etag or '(none)'}")
+
+    full_changed = force or not remote_etag or not cached_etag or remote_etag != cached_etag
+
+    if full_changed:
+        if force:
+            print("  → --force specified; re-downloading full dataset")
+        elif not remote_etag:
+            print("  → could not read remote ETag; re-downloading to be safe")
+        elif not cached_etag:
+            print("  → no cached copy found; downloading full dataset")
+        else:
+            print("  → ETag changed; downloading updated full dataset")
+        _download(FCC_AMAT_URL, CACHE_ZIP)
+        if remote_etag:
+            ETAG_FILE.write_text(remote_etag)
+    else:
+        print("  → ETag unchanged; full dataset is current, skipping download")
+
+    # --- Open / initialise database ---
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+
+    if full_changed:
+        print(f"\nLoading into {DB_PATH}")
+        cur = conn.cursor()
+        for _filename, (table, _cols) in FILE_SCHEMAS.items():
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        conn.commit()
+
+        _create_schema(conn)
+
+        total = 0
+        with zipfile.ZipFile(CACHE_ZIP) as zf:
+            available = {info.filename for info in zf.infolist()}
+            missing = [f for f in FILE_SCHEMAS if f not in available]
+            if missing:
+                print(f"  Note: archive does not contain: {', '.join(missing)}")
+            for filename, (table, columns) in FILE_SCHEMAS.items():
+                total += _load_dat(zf, filename, table, columns, conn)
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("DELETE FROM _daily_applied")
+        conn.execute("INSERT OR REPLACE INTO _meta VALUES (?, ?)", ("last_pull", now))
+        if snapshot_dt:
+            conn.execute("INSERT OR REPLACE INTO _meta VALUES (?, ?)",
+                         ("snapshot_date", snapshot_dt.isoformat()))
+        conn.commit()
+        print(f"\nDone. {total:,} total records loaded into {DB_PATH}")
+    else:
+        _create_schema(conn)  # Ensures new tables/indexes exist on schema upgrades
+
+    # --- Apply daily incremental updates ---
+    _pull_daily(conn, force=force)
+    conn.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "hamdat - FCC Amateur Radio License Database\n"
+            "Author: Matt Hoskins, K2TTA  <k2tta@arrl.net>"
+        ),
+        epilog="Data: https://www.fcc.gov/uls/transactions/daily-weekly.html",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # --- Data management ---
+    parser.add_argument(
+        "--pull", action="store_true",
+        help="Download FCC amateur radio license data and load into SQLite",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Force re-download even if cached data appears current",
+    )
+
+    # --- Queries ---
+    parser.add_argument(
+        "--call", metavar="CALLSIGN",
+        help="Look up a callsign and display a formatted operator profile",
+    )
+    parser.add_argument(
+        "--zip", metavar="ZIPCODE",
+        help="Find active operators within --radius-miles of ZIPCODE (distances are "
+             "approximate, based on ZIP code centroid data)",
+    )
+    parser.add_argument(
+        "--name", metavar="QUERY",
+        help="Search active operators by name (substring or --regex)",
+    )
+    parser.add_argument(
+        "--address", metavar="QUERY",
+        help="Search active operators by any part of mailing address (substring or --regex)",
+    )
+    parser.add_argument(
+        "--regex", action="store_true",
+        help="Treat --name / --address query as a Python regular expression",
+    )
+    parser.add_argument(
+        "--radius-miles", type=float, default=0, metavar="MILES",
+        help="Search radius in miles for --zip; 0 = exact ZIP only (default: 0). "
+             "Distances are approximate based on ZIP code centroid data.",
+    )
+
+    # --- Output format (mutually exclusive) ---
+    fmt_group = parser.add_mutually_exclusive_group()
+    fmt_group.add_argument(
+        "--table", dest="fmt", action="store_const", const="table",
+        help="Print results as a formatted table to stdout (default)",
+    )
+    fmt_group.add_argument(
+        "--csv", dest="fmt", action="store_const", const="csv",
+        help="Write results as CSV to --file",
+    )
+    fmt_group.add_argument(
+        "--json", dest="fmt", action="store_const", const="json",
+        help="Write results as JSON to --file",
+    )
+    fmt_group.add_argument(
+        "--html", dest="fmt", action="store_const", const="html",
+        help="Write results as an HTML table to --file",
+    )
+    parser.set_defaults(fmt="table")
+
+    # --- Paths ---
+    parser.add_argument(
+        "--file", default=None, metavar="PATH",
+        help="Output file for --csv / --json / --html (default: ~/.hamdat/results.{ext})",
+    )
+    parser.add_argument(
+        "--db", default=str(DB_PATH), metavar="PATH",
+        help=f"SQLite database path (default: {DB_PATH})",
+    )
+    parser.add_argument(
+        "--cache-dir", default=str(CACHE_DIR), metavar="DIR",
+        help=f"Cache directory for downloaded files (default: {CACHE_DIR})",
+    )
+
+    args = parser.parse_args()
+    fmt  = args.fmt
+
+    if args.pull:
+        pull(db_path=args.db, cache_dir=args.cache_dir, force=args.force)
+    elif args.zip:
+        find_radius(args.zip, distance_miles=args.radius_miles,
+                    fmt=fmt, outfile=args.file, db_path=args.db)
+    elif args.name:
+        search_name(args.name, regex=args.regex, fmt=fmt, outfile=args.file, db_path=args.db)
+    elif args.address:
+        search_address(args.address, regex=args.regex, fmt=fmt, outfile=args.file, db_path=args.db)
+    elif args.call:
+        lookup(args.call, db_path=args.db)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
