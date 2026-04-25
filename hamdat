@@ -195,7 +195,7 @@ def _create_schema(conn):
     conn.commit()
 
 
-def _load_dat(zf, filename, table, columns, conn):
+def _load_dat(zf, filename, table, columns, conn, or_ignore=False):
     try:
         info = zf.getinfo(filename)
     except KeyError:
@@ -205,7 +205,8 @@ def _load_dat(zf, filename, table, columns, conn):
     n_cols = len(columns)
     placeholders = ",".join("?" * n_cols)
     col_names = ",".join(f'"{c}"' for c in columns)
-    sql = f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders})'
+    verb = "INSERT OR IGNORE" if or_ignore else "INSERT"
+    sql = f'{verb} INTO "{table}" ({col_names}) VALUES ({placeholders})'
 
     cur = conn.cursor()
     batch = []
@@ -963,7 +964,8 @@ def pull(db_path=None, cache_dir=None, force=False):
             if missing:
                 print(f"  Note: archive does not contain: {', '.join(missing)}")
             for filename, (table, columns) in FILE_SCHEMAS.items():
-                total += _load_dat(zf, filename, table, columns, conn)
+                total += _load_dat(zf, filename, table, columns, conn,
+                                   or_ignore=(table == "history"))
 
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("DELETE FROM _daily_applied")
