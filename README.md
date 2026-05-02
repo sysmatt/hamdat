@@ -7,6 +7,10 @@ A command-line utility for downloading, caching, and querying FCC Amateur Radio 
 
 Data is stored locally in a SQLite database (~500 MB) and kept current by applying FCC daily incremental updates on top of the weekly full snapshot.
 
+NOTE:  The SQLite database is used by external utilities and the 
+          schema should be considered locked in except for major 
+          improvements or fixes.  
+
 ---
 
 ## Requirements
