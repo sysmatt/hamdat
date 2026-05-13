@@ -455,6 +455,20 @@ _SQL_OPERATOR = """
 _W = 78  # display width
 
 
+def _fmt_po_box(val):
+    """Normalize a raw FCC po_box field value to a displayable string.
+    The FCC data stores bare box numbers (e.g. '525') most of the time,
+    but sometimes includes the full label already ('PO Box 525').
+    Junk values like 'none' / ' ' are discarded.
+    """
+    v = (val or "").strip()
+    if not v or v.upper() == "NONE":
+        return ""
+    if "BOX" in v.upper():
+        return v
+    return f"PO BOX {v}"
+
+
 def _hr(char="─"):
     return " " + char * (_W - 1)
 
@@ -535,16 +549,20 @@ def _display_call(call, hd, en, am, history):
     # CONTACT
     rows = []
     if en:
-        addr1 = (en["street_address"] or "").strip() or (en["po_box"] or "").strip()
+        street = (en["street_address"] or "").strip()
+        po_box = _fmt_po_box(en["po_box"])
         city_state = ", ".join(p for p in [en["city"], en["state"]] if p and p.strip())
         zip_code = (en["zip_code"] or "").strip()
-        addr2 = f"{city_state}  {zip_code}".strip() if zip_code else city_state
-        if addr1:
-            rows.append(_field("Address", addr1))
-            if addr2:
-                rows.append(_field("", addr2))
-        elif addr2:
-            rows.append(_field("Address", addr2))
+        addr_last = f"{city_state}  {zip_code}".strip() if zip_code else city_state
+        addr_lines = [p for p in [street, po_box] if p]
+        if addr_lines:
+            rows.append(_field("Address", addr_lines[0]))
+            for extra in addr_lines[1:]:
+                rows.append(_field("", extra))
+            if addr_last:
+                rows.append(_field("", addr_last))
+        elif addr_last:
+            rows.append(_field("Address", addr_last))
         rows.append(_field("Phone", en["phone"]))
         rows.append(_field("Email", en["email"]))
     rows = [r for r in rows if r]
@@ -577,9 +595,11 @@ def _row_to_result(row):
     name = " ".join(
         p for p in [row["first_name"], row["mi"], row["last_name"]] if p
     ).strip() or (row["entity_name"] or "").strip()
-    street  = (row["street_address"] or row["po_box"] or "").strip()
+    street  = (row["street_address"] or "").strip()
+    po_box  = _fmt_po_box(row["po_box"])
+    addr_parts = [p for p in [street, po_box] if p]
     city_st = ", ".join(p for p in [row["city"], row["state"]] if p and (p or "").strip())
-    address = "  ".join(p for p in [street, city_st, zc] if p)
+    address = "  ".join(p for p in [*addr_parts, city_st, zc] if p)
     return {
         "call_sign":      (row["call_sign"]      or "").strip(),
         "name":           name,
