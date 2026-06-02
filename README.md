@@ -7,9 +7,7 @@ A command-line utility for downloading, caching, and querying FCC Amateur Radio 
 
 Data is stored locally in a SQLite database (~500 MB) and kept current by applying FCC daily incremental updates on top of the weekly full snapshot.
 
-NOTE:  The SQLite database is used by external utilities and the 
-          schema should be considered locked in except for major 
-          improvements or fixes.  
+> **Note:** The SQLite database is used by external utilities and the schema is considered locked in. Structural changes are major events only.
 
 ---
 
@@ -17,7 +15,7 @@ NOTE:  The SQLite database is used by external utilities and the
 
 - Python 3.9+
 - [`requests`](https://pypi.org/project/requests/) — HTTP downloads
-- [`pgeocode`](https://pypi.org/project/pgeocode/) — offline ZIP code geocoding (only needed for `--find-radius`)
+- [`pgeocode`](https://pypi.org/project/pgeocode/) — offline ZIP code geocoding (only needed for `--zip` radius search)
 
 ```
 pip install requests pgeocode
@@ -37,7 +35,7 @@ cp hamdat ~/bin/      # or anywhere on your PATH
 ## Usage
 
 ```
-hamdat [--pull] [--force] [--call CALLSIGN] [--zip ZIPCODE] [--name QUERY] [--address QUERY] [options]
+hamdat [--pull] [--status] [--call CALLSIGN] [--callsearch QUERY] [--zip ZIPCODE] [--name QUERY] [--address QUERY] [--type TYPE] [options]
 ```
 
 ### Options
@@ -49,17 +47,22 @@ hamdat [--pull] [--force] [--call CALLSIGN] [--zip ZIPCODE] [--name QUERY] [--ad
 | `--pull` | Download FCC data and load into the local SQLite database |
 | `--force` | Force re-download of the full dataset even if the cached copy is current |
 | `--zips-folder DIR` | Load FCC zip files from a local folder instead of downloading |
+| `--status` | Show the state of the local database, cached FCC files, and pgeocode ZIP data |
 
 **Queries**
 
 | Flag | Description |
 |---|---|
-| `--call CALLSIGN` | Look up a callsign and display a formatted operator profile |
+| `--call CALLSIGN` | Look up a **single** callsign — full formatted profile (exact match) |
+| `--history` | With `--call`: append a compact table of all past licensees for the callsign |
+| `--full-history` | With `--call`: show full formatted records for every past licensee |
+| `--callsearch QUERY` | Search active operators by callsign (substring or `--regex`); returns a list |
+| `--name QUERY` | Search active operators by name (substring or `--regex`) |
+| `--address QUERY` | Search active operators by any part of mailing address (substring or `--regex`) |
+| `--type TYPE` | Filter by entity type: `individual`, `club`, `races`, `military`, `government` (or raw FCC code) |
 | `--zip ZIPCODE` | Find active operators near a ZIP code (see `--radius-miles`) |
-| `--name QUERY` | Search active operators by name |
-| `--address QUERY` | Search active operators by any part of mailing address |
-| `--radius-miles MILES` | Search radius for `--zip` (default: `0` — exact ZIP only). Distances are approximate, based on ZIP code centroid data. |
-| `--regex` | Treat `--name` / `--address` query as a Python regular expression |
+| `--radius-miles MILES` | Search radius for `--zip`; `0` = exact ZIP only (default: `0`) |
+| `--regex` | Treat `--callsearch` / `--name` / `--address` as a Python regular expression |
 
 **Output format** *(mutually exclusive; default is `--table`)*
 
@@ -88,13 +91,7 @@ hamdat [--pull] [--force] [--call CALLSIGN] [--zip ZIPCODE] [--name QUERY] [--ad
 hamdat --pull
 ```
 
-Downloads the FCC weekly snapshot (`l_amat.zip`, ~200 MB compressed) from:
-
-```
-https://data.fcc.gov/download/pub/uls/complete/l_amat.zip
-```
-
-After loading the full snapshot, `--pull` automatically checks all seven FCC daily change files and applies any that were published after the weekly snapshot. Output shows exactly which dates are being compared and why each file is applied or skipped:
+Downloads the FCC weekly snapshot (`l_amat.zip`, ~200 MB compressed), loads it into the local SQLite database, applies any daily update files published since the snapshot, and pre-seeds the pgeocode ZIP code cache so that radius searches work offline immediately.
 
 ```
 Checking weekly snapshot ...
@@ -114,15 +111,10 @@ Checking daily updates (snapshot baseline: 2026-04-20 02:14 UTC)
   sun:  2026-04-19 04:00 UTC  → predates snapshot, skipping
   mon:  2026-04-20 04:00 UTC  → predates snapshot, skipping
   tue:  2026-04-21 04:00 UTC  → will apply
-  wed:  2026-04-22 04:00 UTC  → will apply
-  thu:  2026-04-23 04:00 UTC  → will apply
-  fri:  2026-04-24 04:00 UTC  → will apply
-  sat:  2026-04-25 04:00 UTC  → will apply
-
-Applying 5 daily update(s):
-  [tue]  4,102 records, 987 licenses updated
-  [wed]  3,891 records, 901 licenses updated
   ...
+
+Seeding pgeocode ZIP cache ...
+  pgeocode cache ready.
 ```
 
 ### Keeping the database current
@@ -130,9 +122,9 @@ Applying 5 daily update(s):
 Run `--pull` at any time — it is safe and incremental:
 
 - If the weekly snapshot ETag hasn't changed, the full download is skipped.
-- Daily files are compared by their `Last-Modified` date against the stored snapshot baseline.
-- Files whose ETag matches what was last applied are skipped.
+- Daily files are compared by `Last-Modified` date against the stored snapshot baseline; already-applied files are skipped by ETag.
 - New files are downloaded and applied in chronological order.
+- The pgeocode cache is verified and re-seeded if missing.
 
 ```
 hamdat --pull
@@ -158,15 +150,94 @@ Re-downloads the full weekly snapshot regardless of ETag, drops and reloads all 
 
 ---
 
+## Offline Operations
+
+hamdat is designed to work fully offline after an initial setup. Understanding what requires network access helps you plan for air-gapped or low-connectivity environments.
+
+### What requires network access
+
+| Operation | Network required |
+|---|---|
+| `--pull` (remote mode) | Yes — downloads FCC snapshot and daily files |
+| `--pull --zips-folder` | No — reads from local files only |
+| `--call`, `--callsearch`, `--name`, `--address`, `--type` | No |
+| `--zip` radius search (after first use) | No |
+| `--zip` radius search (first ever use) | Yes — one-time pgeocode data download (~1 MB) |
+| `--status` | No |
+
+### Ensuring full offline readiness
+
+Run `--pull` at least once while connected. This builds the database **and** pre-seeds the pgeocode ZIP code cache in one step. After that, all queries including radius searches work with no network access.
+
+To verify readiness before going offline:
+
+```
+hamdat --status
+```
+
+Sample output:
+
+```
+Database: /home/user/.hamdat/hamdat.db
+  Size                   487.3 MB
+  Snapshot date          2026-05-25 02:14 UTC
+  Last pull              2026-06-02 14:23 UTC
+  Daily updates          mon, tue, wed, thu
+    last applied         2026-06-02 14:23 UTC
+
+  Table                    Records
+  ──────────────────────── ──────────────
+  License headers            3,842,100
+  Entity records             4,201,883
+  Amateur records              783,441
+  History entries            1,293,004
+  Comments                      42,817
+
+Weekly snapshot cache: /home/user/.hamdat/l_amat.zip
+  Size                   198.4 MB
+  Downloaded             2026-05-25 03:41 UTC
+  ETag                   "d41d8cd98f00b204e980..."
+
+pgeocode ZIP cache:
+  Cached                 2026-05-30 11:42 UTC
+  Cache path             /home/user/.cache/pgeocode/
+  Files                  3  (1,024 KB)
+```
+
+### Offline setup on an air-gapped machine
+
+1. On a connected machine, download the FCC zip files manually:
+   - Weekly snapshot: `https://data.fcc.gov/download/pub/uls/complete/l_amat.zip`
+   - Daily files: `https://data.fcc.gov/download/pub/uls/daily/l_am_sun.zip` … `l_am_sat.zip`
+2. Copy the zip files to a folder on the target machine.
+3. Run: `hamdat --pull --zips-folder /path/to/zips/`
+4. For pgeocode, copy `~/.cache/pgeocode/` from the connected machine to the same path on the target machine.
+
+---
+
 ## Commands
+
+### `--call` vs `--callsearch` — single record vs. list
+
+These two flags serve distinct purposes:
+
+| Flag | Match type | Output |
+|---|---|---|
+| `--call CALLSIGN` | Exact, case-insensitive | Full formatted operator profile (one record) |
+| `--callsearch QUERY` | Substring or regex (active licenses only) | Tabular list supporting all output formats |
+
+Use `--call` when you know the exact callsign. Use `--callsearch` when searching for a prefix, suffix, or pattern across multiple callsigns.
+
+---
 
 ### `--call` — Look up a callsign
 
 ```
 hamdat --call W1AW
+hamdat --call K2TTA
 ```
 
-Displays a formatted operator profile. Lookups are anchored to the current license grant's `unique_system_identifier` so the correct licensee is shown even when a callsign has changed hands.
+Displays a full formatted operator profile for a single, exact callsign. Always shows the most recent active licensee — correctly handles callsigns that have changed hands. Fails with a message if the callsign is not found.
 
 Example output:
 
@@ -207,51 +278,192 @@ Example output:
 ==============================================================================
 ```
 
-### `--zip` — Find operators by ZIP code
+For club callsigns, a `Type` line appears in the OPERATOR section:
 
 ```
-hamdat --zip 06111
-hamdat --zip 06111 --radius-miles 25
-hamdat --zip 06111 --radius-miles 25 --csv --file nearby.csv
-hamdat --zip 06111 --radius-miles 25 --html --file nearby.html
+  OPERATOR
+  ─────────────────────────────────────────────────────────────────────────────
+  Type              Amateur Club  (B)
+  First Licensed    03/15/2005
+  ...
 ```
 
-Finds all active license holders within the specified radius of a ZIP code. With the default radius of 0, only operators whose mailing address is in that exact ZIP code are returned. Uses an offline ZIP code database (pgeocode) — no network requests, no rate limits.
+### `--history` — compact licensee history
 
-> **Note:** Distances are approximate. The radius search is based on ZIP code centroid coordinates, not precise addresses. An operator listed 12.3 miles away may live closer or farther depending on where within their ZIP code they actually reside.
+```
+hamdat --call W2LV --history
+```
 
-**How it works:**
+Appends a compact table showing all past licensees for the callsign after the normal profile, sorted most-recent first. Useful when a callsign has changed hands between individuals and clubs.
 
-1. Collects all unique 5-digit ZIP codes from active licenses in the DB (~30k)
-2. Batch-geocodes them all via pgeocode (in-memory, instant)
-3. Filters to those within the radius using the Haversine formula
-4. Queries the DB for operators in those ZIP codes
+```
+  LICENSEE HISTORY  (2 record(s), most recent first)
+  ─────────────────────────────────────────────────────────────────────────────
+  STATUS     NAME                        CLASS / TYPE    GRANTED     EXPIRED     USID
+  ─────────  ──────────────────────────  ──────────────  ──────────  ──────────  ──────────
+  Active     Lake Valley ARC             Amateur Club    04/15/2019  04/15/2029  4567890
+  Canceled   John Smith                  Amateur Extra   01/15/2010  03/20/2018  1234567
+```
+
+### `--full-history` — full records for all past licensees
+
+```
+hamdat --call W2LV --full-history
+```
+
+Shows the complete formatted operator profile for every licensee that has ever held the callsign, separated by `Record X of Y` banners, most-recent first. FCC action history is shown only for the most recent record.
+
+```
+──────────────────────── Record 1 of 2 ─────────────────────────
+==============================================================================
+  W2LV                                                   [ ACTIVE ]
+  Lake Valley ARC                                         Amateur Club
+==============================================================================
+  ...
+
+──────────────────────── Record 2 of 2 ─────────────────────────
+==============================================================================
+  W2LV                                                   [ CANCELED ]
+  John Smith                                              Amateur Extra
+==============================================================================
+  ...
+```
+
+---
+
+### `--callsearch` — Search by callsign
+
+Returns a tabular list of active operators whose callsign matches the query. Supports all output formats.
+
+**Substring (default):**
+```
+hamdat --callsearch "W2"              # all calls containing W2
+hamdat --callsearch "K2T"             # all calls containing K2T
+hamdat --callsearch "AA"              # all calls containing AA
+```
+
+**Regex (`--regex`):**
+```
+hamdat --callsearch "^W2" --regex     # calls starting with W2
+hamdat --callsearch "^K2T" --regex    # calls starting with K2T
+hamdat --callsearch "^W[0-9]A$" --regex   # 1x1 format calls (special event style)
+hamdat --callsearch "^(K|W)2" --regex --csv --file w2.csv
+```
+
+---
 
 ### `--name` — Search by operator name
 
+Searches `first_name`, `last_name`, and `entity_name` fields for active licensees.
+
+**Substring (default):**
 ```
 hamdat --name "Smith"
-hamdat --name "John.*Smith" --regex
-hamdat --name "ARRL" --json --file clubs.json
+hamdat --name "Lake Valley"
+hamdat --name "Radio Club"
 ```
 
-Searches the `first_name`, `last_name`, and `entity_name` fields for active licensees. By default uses a case-insensitive substring match. With `--regex`, the query is treated as a Python regular expression.
+**Regex (`--regex`):**
+```
+hamdat --name "^John.*Smith$" --regex
+hamdat --name "Radio.*(Club|Society)" --regex
+hamdat --name "^ARRL" --regex --json --file arrl.json
+```
+
+---
 
 ### `--address` — Search by mailing address
 
+Searches across `street_address`, `po_box`, `city`, `state`, and `zip_code` for active licensees.
+
+**Substring (default):**
 ```
+hamdat --address "Newington"
 hamdat --address "Main St"
-hamdat --address "Newington" --html --file newington.html
-hamdat --address "^06[0-9]{3}$" --regex
+hamdat --address "CT"
 ```
 
-Searches across `street_address`, `po_box`, `city`, `state`, and `zip_code` for active licensees. Supports the same substring and `--regex` modes as `--name`.
+**Regex (`--regex`):**
+```
+hamdat --address "^06[0-9]{3}$" --regex        # all Connecticut ZIP codes
+hamdat --address "^(CT|NY|NJ)$" --regex        # tri-state area
+hamdat --address "Elm.*(St|Ave|Rd)" --regex
+```
+
+---
+
+### `--type` — Filter by entity type
+
+Filters results by the FCC applicant type. Accepts a friendly name or raw FCC code. Can be combined with any search flag.
+
+| Friendly name | FCC code | Description |
+|---|---|---|
+| `individual` | `I` | Individual person |
+| `club` | `B` | Amateur club |
+| `races` | `R` | RACES organization |
+| `military` | `M` | Military recreation |
+| `government` | `G` | Government entity |
+
+```
+hamdat --type club                           # all active clubs
+hamdat --type club --name "Radio"            # clubs with "Radio" in the name
+hamdat --type club --callsearch "^W2" --regex   # W2 club callsigns
+hamdat --type individual --name "Smith" --address "CT"
+hamdat --type B                              # raw FCC code also works
+```
+
+---
+
+### `--zip` — Find operators by ZIP code
+
+Finds all active license holders within the specified radius of a ZIP code.
+
+```
+hamdat --zip 07030
+hamdat --zip 07030 --radius-miles 25
+hamdat --zip 07030 --radius-miles 25 --csv --file nearby.csv
+hamdat --zip 07030 --radius-miles 25 --html --file nearby.html
+```
+
+With `--radius-miles 0` (default), only operators whose mailing address ZIP exactly matches are returned.
+
+> **Note:** Distances are approximate. The radius search is based on ZIP code centroid coordinates, not precise addresses.
+
+**Combined with other filters:**
+```
+hamdat --zip 07848 --radius-miles 20 --type club
+hamdat --zip 06111 --radius-miles 10 --name "Smith"
+hamdat --zip 10001 --radius-miles 50 --callsearch "^W2" --regex --type club
+```
+
+---
+
+### Combining search flags — AND logic
+
+When multiple search flags are specified together, results must satisfy **all** conditions (AND, not OR):
+
+```
+# Clubs within 20 miles of ZIP 07848
+hamdat --zip 07848 --radius-miles 20 --type club
+
+# Operators named Smith in Connecticut
+hamdat --name "Smith" --address "CT"
+
+# W2 callsigns belonging to clubs
+hamdat --callsearch "^W2" --regex --type club
+
+# Name contains "Radio", callsign starts with W, in New Jersey
+hamdat --name "Radio" --callsearch "^W" --address "NJ"
+
+# Extra class operators named Johnson
+hamdat --name "Johnson" --callsearch "^N" --regex
+```
 
 ---
 
 ## Output formats
 
-All tabular commands (`--find-radius`, `--name`, `--address`) support four output formats selected by a mutually exclusive flag:
+All tabular commands (`--callsearch`, `--name`, `--address`, `--type`, `--zip`) support four output formats:
 
 | Flag | Destination | Default filename |
 |---|---|---|
@@ -260,18 +472,16 @@ All tabular commands (`--find-radius`, `--name`, `--address`) support four outpu
 | `--json` | file | `~/.hamdat/results.json` |
 | `--html` | file | `~/.hamdat/results.html` |
 
-Use `--file PATH` to override the output file location. The `--table` output auto-sizes columns from the data and truncates values that exceed per-column maximums; `--csv`, `--json`, and `--html` always include the full untruncated values.
+Use `--file PATH` to override the output file location. The `--table` output auto-sizes columns and truncates values that exceed per-column maximums; `--csv`, `--json`, and `--html` always include full untruncated values.
 
 ### Result fields
-
-All tabular output contains the following fields. `distance_miles` is only present for `--find-radius`.
 
 | Field | Description |
 |---|---|
 | `call_sign` | FCC callsign |
-| `distance_miles` | Distance from reference ZIP *(find-radius only)* |
-| `name` | Licensee name |
-| `operator_class` | License class (e.g. Amateur Extra) |
+| `distance_miles` | Distance from reference ZIP *(--zip with --radius-miles only)* |
+| `name` | Licensee name or entity name |
+| `operator_class` | License class for individuals (e.g. `Amateur Extra`); entity type for non-individuals (e.g. `Amateur Club`) |
 | `address` | Full mailing address (street/PO box + city, state + ZIP) |
 | `city` | City |
 | `state` | State abbreviation |
@@ -299,17 +509,17 @@ The weekly file is replaced each Sunday. Daily files are replaced each week on t
 | Table | Source file | Contents |
 |---|---|---|
 | `license_header` | `HD.dat` | License status, dates, call sign |
-| `entity` | `EN.dat` | Licensee name, address, contact info |
+| `entity` | `EN.dat` | Licensee name, address, contact info, entity type |
 | `amateur` | `AM.dat` | Operator class, group, region |
 | `history` | `HS.dat` | License action history |
 | `comments` | `CO.dat` | FCC comments |
 | `special_condition` | `SC.dat` | Special conditions |
 | `license_free_form_special_condition` | `SF.dat` | Free-form special conditions |
 | `license_attachment` | `LA.dat` | Attachments |
-| `_meta` | — | Internal metadata (snapshot date, last pull) |
+| `_meta` | — | Internal metadata (snapshot date, last pull timestamp) |
 | `_daily_applied` | — | Tracks which daily file ETags have been applied |
 
-All tables are indexed on `call_sign` and `unique_system_identifier`. The `unique_system_identifier` (USID) is the key that links all tables for a single license grant.
+All tables are indexed on `call_sign` and `unique_system_identifier`. The `unique_system_identifier` (USID) is the key linking all tables for a single license grant.
 
 ---
 
@@ -319,13 +529,14 @@ All files are stored under `~/.hamdat/` by default:
 
 ```
 ~/.hamdat/
-  hamdat.db          SQLite database
-  l_amat.zip         Cached weekly snapshot
+  hamdat.db          SQLite database (~500 MB)
+  l_amat.zip         Cached weekly snapshot (~200 MB)
   l_amat.etag        ETag for the weekly snapshot
   l_am_sun.zip       Cached daily files (one per day)
-  l_am_sun.etag
   ...
   results.csv        Default output for --csv
   results.json       Default output for --json
   results.html       Default output for --html
+
+~/.cache/pgeocode/   pgeocode US postal code data (~1 MB, seeded by --pull)
 ```

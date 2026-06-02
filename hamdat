@@ -411,6 +411,22 @@ _STATUS_NAMES = {
     "L": "Pending Legal Status",
 }
 
+_APPLICANT_TYPE_NAMES = {
+    "I": "Individual",
+    "B": "Amateur Club",
+    "R": "RACES",
+    "M": "Military Recreation",
+    "G": "Government Entity",
+}
+
+_TYPE_CODES = {
+    "individual":  "I",
+    "club":        "B",
+    "races":       "R",
+    "military":    "M",
+    "government":  "G",
+}
+
 _HISTORY_CODES = {
     "LIAG": "Issued — After Grant",
     "LIRN": "Issued — After Renewal",
@@ -444,7 +460,7 @@ _SQL_OPERATOR = """
            e.first_name, e.mi, e.last_name, e.entity_name,
            e.street_address, e.po_box, e.city, e.state,
            SUBSTR(TRIM(e.zip_code), 1, 5) AS zip5,
-           e.email, a.operator_class
+           e.email, a.operator_class, e.applicant_type_code
     FROM license_header h
     JOIN entity e ON e.unique_system_identifier = h.unique_system_identifier
          AND (e.entity_type = 'L' OR e.entity_type = '')
@@ -510,6 +526,11 @@ def _display_call(call, hd, en, am, history):
 
     # OPERATOR
     rows = []
+    if en:
+        tc = (en["applicant_type_code"] or "").strip()
+        if tc and tc != "I":
+            type_str = _APPLICANT_TYPE_NAMES.get(tc, tc)
+            rows.append(_field("Type", f"{type_str}  ({tc})"))
     if class_code:
         rows.append(_field("Class", f"{class_str}  ({class_code})"))
     if am:
@@ -588,6 +609,50 @@ def _display_call(call, hd, en, am, history):
     print()
 
 
+def _display_history_table(all_hd):
+    """Compact table of all licensees for a callsign, most recent first."""
+    if not all_hd:
+        return
+    print()
+    print(f"  LICENSEE HISTORY  ({len(all_hd)} record(s), most recent first)")
+    print(_hr())
+
+    cols   = ["STATUS", "NAME", "CLASS / TYPE", "GRANTED", "EXPIRED", "USID"]
+    widths = [9, 26, 14, 10, 10, 10]
+
+    print("  " + "  ".join(h.ljust(w) for h, w in zip(cols, widths)))
+    print("  " + "  ".join("─" * w for w in widths))
+
+    for rec in all_hd:
+        status = _STATUS_NAMES.get((rec["license_status"] or "").strip(),
+                                   (rec["license_status"] or "").strip())
+        fn    = (rec["first_name"]  or "").strip()
+        ln    = (rec["last_name"]   or "").strip()
+        ename = (rec["entity_name"] or "").strip()
+        name  = (" ".join(p for p in [fn, ln] if p)) or ename
+        ct    = _class_or_type(rec["operator_class"], rec["applicant_type_code"])
+        row   = [status, name, ct,
+                 (rec["grant_date"]                or "").strip(),
+                 (rec["expired_date"]              or "").strip(),
+                 (rec["unique_system_identifier"]  or "").strip()]
+        print("  " + "  ".join(_trunc(v, w).ljust(w) for v, w in zip(row, widths)))
+
+    print()
+    print("=" * _W)
+    print()
+
+
+def _class_or_type(op_class, applicant_type_code):
+    """Return operator class for individuals, entity type label for everyone else."""
+    oc = (op_class or "").strip()
+    if oc:
+        return _CLASS_NAMES.get(oc, oc)
+    tc = (applicant_type_code or "").strip()
+    if tc and tc != "I":
+        return _APPLICANT_TYPE_NAMES.get(tc, tc)
+    return ""
+
+
 def _row_to_result(row):
     """Convert a joined sqlite3.Row (header + entity + amateur) to a standard result dict."""
     row_keys = row.keys()
@@ -603,7 +668,7 @@ def _row_to_result(row):
     return {
         "call_sign":      (row["call_sign"]      or "").strip(),
         "name":           name,
-        "operator_class": _CLASS_NAMES.get(row["operator_class"] or "", row["operator_class"] or ""),
+        "operator_class": _class_or_type(row["operator_class"], row["applicant_type_code"]),
         "address":        address,
         "city":           (row["city"]            or "").strip(),
         "state":          (row["state"]           or "").strip(),
@@ -707,7 +772,22 @@ def _output_results(results, fieldnames, fmt, outfile):
         _write_html(results, fieldnames, outfile or CACHE_DIR / "results.html")
 
 
-def lookup(callsign, db_path=None):
+def _fetch_en_am(conn, usid):
+    """Fetch entity and amateur rows for a given USID."""
+    en = conn.execute(
+        """SELECT * FROM entity WHERE unique_system_identifier = ?
+           ORDER BY CASE WHEN entity_type = 'L' THEN 0 ELSE 1 END, id
+           LIMIT 1""",
+        (usid,),
+    ).fetchone()
+    am = conn.execute(
+        "SELECT * FROM amateur WHERE unique_system_identifier = ? ORDER BY id DESC LIMIT 1",
+        (usid,),
+    ).fetchone()
+    return en, am
+
+
+def lookup(callsign, db_path=None, show_history=False, show_full_history=False):
     db = Path(db_path or DB_PATH)
     if not db.exists():
         sys.exit(f"Database not found: {db}\nRun --pull first.")
@@ -716,29 +796,52 @@ def lookup(callsign, db_path=None):
     conn = sqlite3.connect(db)
     conn.row_factory = sqlite3.Row
 
+    if show_full_history:
+        all_hd_rows = conn.execute(
+            """SELECT * FROM license_header WHERE call_sign = ?
+               ORDER BY CASE WHEN license_status = 'A' THEN 0 ELSE 1 END,
+                        last_action_date DESC, id DESC""",
+            (call,),
+        ).fetchall()
+        if not all_hd_rows:
+            print(f"No record found for callsign: {call}")
+            conn.close()
+            return
+        full_records = []
+        for rec_hd in all_hd_rows:
+            rec_en, rec_am = _fetch_en_am(conn, rec_hd["unique_system_identifier"])
+            full_records.append((rec_hd, rec_en, rec_am))
+        fcc_history = conn.execute(
+            "SELECT * FROM history WHERE call_sign = ? ORDER BY log_date DESC LIMIT 10",
+            (call,),
+        ).fetchall()
+        conn.close()
+        total = len(full_records)
+        for i, (rec_hd, rec_en, rec_am) in enumerate(full_records, 1):
+            label = f" Record {i} of {total} "
+            dashes = "─" * ((_W - len(label)) // 2)
+            print(f"\n{dashes}{label}{dashes}")
+            _display_call(call, rec_hd, rec_en, rec_am, fcc_history if i == 1 else [])
+        return
+
+    # Prefer the active license; fall back to most-recently-acted-on inactive record.
+    # Sorting by id DESC alone can return the wrong holder when the file load order
+    # doesn't match chronological grant order.
     hd = conn.execute(
-        "SELECT * FROM license_header WHERE call_sign = ? ORDER BY id DESC LIMIT 1",
+        """SELECT * FROM license_header WHERE call_sign = ?
+           ORDER BY CASE WHEN license_status = 'A' THEN 0 ELSE 1 END,
+                    last_action_date DESC, id DESC
+           LIMIT 1""",
         (call,),
     ).fetchone()
 
     # Anchor entity and amateur lookups to the current license's USID so we
     # don't pick up records from a previous holder of the same callsign.
     usid = hd["unique_system_identifier"] if hd else None
-
     if usid:
-        en = conn.execute(
-            """SELECT * FROM entity WHERE unique_system_identifier = ?
-               ORDER BY CASE WHEN entity_type = 'L' THEN 0 ELSE 1 END, id
-               LIMIT 1""",
-            (usid,),
-        ).fetchone()
-        am = conn.execute(
-            "SELECT * FROM amateur WHERE unique_system_identifier = ? ORDER BY id DESC LIMIT 1",
-            (usid,),
-        ).fetchone()
+        en, am = _fetch_en_am(conn, usid)
     else:
-        en = None
-        am = None
+        en = am = None
 
     if not any([hd, en, am]):
         print(f"No record found for callsign: {call}")
@@ -750,8 +853,24 @@ def lookup(callsign, db_path=None):
         (call,),
     ).fetchall()
 
+    all_hd = []
+    if show_history:
+        all_hd = conn.execute(
+            """SELECT h.*, e.first_name, e.mi, e.last_name, e.entity_name,
+                      e.applicant_type_code, a.operator_class
+               FROM license_header h
+               LEFT JOIN entity e ON e.unique_system_identifier = h.unique_system_identifier
+                    AND (e.entity_type = 'L' OR e.entity_type = '')
+               LEFT JOIN amateur a ON a.unique_system_identifier = h.unique_system_identifier
+               WHERE h.call_sign = ?
+               ORDER BY last_action_date DESC, h.id DESC""",
+            (call,),
+        ).fetchall()
+
     conn.close()
     _display_call(call, hd, en, am, history)
+    if show_history:
+        _display_history_table(all_hd)
 
 
 def _haversine_miles(lat1, lon1, lat2, lon2):
@@ -762,70 +881,125 @@ def _haversine_miles(lat1, lon1, lat2, lon2):
     return R * 2 * atan2(sqrt(a), sqrt(1 - a))
 
 
-def find_radius(zipcode, distance_miles=0, fmt="table", outfile=None, db_path=None):
-    try:
-        import pgeocode
-    except ImportError:
-        sys.exit("Install pgeocode: pip install pgeocode")
+def _register_regexp(conn):
+    conn.create_function("REGEXP", 2,
+        lambda pat, s: bool(re.search(pat, s or "", re.IGNORECASE)))
 
+
+def search_multi(callsearch=None, name=None, address=None, type_code=None,
+                 zipcode=None, distance_miles=0,
+                 regex=False, fmt="table", outfile=None, db_path=None):
+    """Search active operators, ANDing every criterion that is provided."""
     db = Path(db_path or DB_PATH)
     if not db.exists():
         sys.exit(f"Database not found: {db}\nRun --pull first.")
-
-    ref_zip = zipcode.strip().zfill(5)
-    nomi    = pgeocode.Nominatim("us")
-    ref     = nomi.query_postal_code(ref_zip)
-    try:
-        ref_lat = float(ref.latitude)
-        ref_lon = float(ref.longitude)
-        if isnan(ref_lat) or isnan(ref_lon):
-            raise ValueError
-    except (TypeError, ValueError):
-        sys.exit(f"Could not find coordinates for zip code: {ref_zip}")
-
     conn = sqlite3.connect(db)
     conn.row_factory = sqlite3.Row
 
-    # Step 1: collect all unique 5-digit zip codes from active licenses
-    print("Collecting zip codes ...", end="", flush=True)
-    zip_rows = conn.execute("""
-        SELECT DISTINCT SUBSTR(TRIM(e.zip_code), 1, 5) AS zip5
-        FROM license_header h
-        JOIN entity e ON e.unique_system_identifier = h.unique_system_identifier
-        WHERE h.license_status = 'A'
-          AND e.zip_code IS NOT NULL AND e.zip_code != ''
-    """).fetchall()
-    all_zips = [r["zip5"] for r in zip_rows if r["zip5"] and len(r["zip5"]) >= 4]
-    print(f" {len(all_zips):,} unique zip codes")
+    if regex:
+        _register_regexp(conn)
 
-    # Step 2: batch geocode with pgeocode and filter to radius (all in-memory, instant)
-    print("Filtering by distance ...", end="", flush=True)
-    geo_df    = nomi.query_postal_code(all_zips)
-    in_radius = {}  # zip5 -> distance_miles
-    for i, zc in enumerate(all_zips):
+    conds  = []
+    params = []
+
+    # --- ZIP radius: geocode first, then add an IN clause ---
+    in_radius = {}
+    ref_zip   = None
+    if zipcode:
         try:
-            lat = float(geo_df.iloc[i]["latitude"])
-            lon = float(geo_df.iloc[i]["longitude"])
-            if isnan(lat) or isnan(lon):
-                continue
-            d = _haversine_miles(ref_lat, ref_lon, lat, lon)
-            if d <= distance_miles:
-                in_radius[zc] = round(d, 2)
+            import pgeocode
+        except ImportError:
+            sys.exit("Install pgeocode: pip install pgeocode")
+
+        ref_zip = zipcode.strip().zfill(5)
+        nomi    = pgeocode.Nominatim("us")
+        ref     = nomi.query_postal_code(ref_zip)
+        try:
+            ref_lat = float(ref.latitude)
+            ref_lon = float(ref.longitude)
+            if isnan(ref_lat) or isnan(ref_lon):
+                raise ValueError
         except (TypeError, ValueError):
-            pass
-    print(f" {len(in_radius):,} zip codes within {distance_miles} miles")
+            conn.close()
+            sys.exit(f"Could not find coordinates for zip code: {ref_zip}")
 
-    if not in_radius:
-        conn.close()
-        print("No operators found.")
-        return
+        print("Collecting zip codes ...", end="", flush=True)
+        zip_rows = conn.execute("""
+            SELECT DISTINCT SUBSTR(TRIM(e.zip_code), 1, 5) AS zip5
+            FROM license_header h
+            JOIN entity e ON e.unique_system_identifier = h.unique_system_identifier
+            WHERE h.license_status = 'A'
+              AND e.zip_code IS NOT NULL AND e.zip_code != ''
+        """).fetchall()
+        all_zips = [r["zip5"] for r in zip_rows if r["zip5"] and len(r["zip5"]) >= 4]
+        print(f" {len(all_zips):,} unique zip codes")
 
-    # Step 3: fetch operators whose zip falls in the radius
-    placeholders = ",".join("?" * len(in_radius))
-    rows = conn.execute(
-        _SQL_OPERATOR + f"  AND SUBSTR(TRIM(e.zip_code), 1, 5) IN ({placeholders})",
-        list(in_radius),
-    ).fetchall()
+        print("Filtering by distance ...", end="", flush=True)
+        geo_df = nomi.query_postal_code(all_zips)
+        for i, zc in enumerate(all_zips):
+            try:
+                lat = float(geo_df.iloc[i]["latitude"])
+                lon = float(geo_df.iloc[i]["longitude"])
+                if isnan(lat) or isnan(lon):
+                    continue
+                d = _haversine_miles(ref_lat, ref_lon, lat, lon)
+                if d <= distance_miles:
+                    in_radius[zc] = round(d, 2)
+            except (TypeError, ValueError):
+                pass
+        print(f" {len(in_radius):,} zip codes within {distance_miles} miles")
+
+        if not in_radius:
+            conn.close()
+            print("No operators found.")
+            return
+
+        conds.append(
+            f"SUBSTR(TRIM(e.zip_code), 1, 5) IN ({','.join('?' * len(in_radius))})"
+        )
+        params.extend(list(in_radius))
+
+    if callsearch:
+        if regex:
+            conds.append("h.call_sign REGEXP ?")
+            params.append(callsearch)
+        else:
+            conds.append("h.call_sign LIKE ?")
+            params.append(f"%{callsearch}%")
+
+    if name:
+        name_expr = (
+            "COALESCE(e.first_name,'') || ' ' || COALESCE(e.mi,'') || ' '"
+            " || COALESCE(e.last_name,'')"
+        )
+        if regex:
+            conds.append(f"({name_expr} REGEXP ? OR COALESCE(e.entity_name,'') REGEXP ?)")
+            params.extend([name, name])
+        else:
+            conds.append(f"({name_expr} LIKE ? OR COALESCE(e.entity_name,'') LIKE ?)")
+            params.extend([f"%{name}%", f"%{name}%"])
+
+    if address:
+        addr_cols = [
+            "COALESCE(e.street_address,'')",
+            "COALESCE(e.po_box,'')",
+            "COALESCE(e.city,'')",
+            "COALESCE(e.state,'')",
+            "SUBSTR(TRIM(e.zip_code),1,5)",
+        ]
+        if regex:
+            conds.append("(" + " OR ".join(f"{c} REGEXP ?" for c in addr_cols) + ")")
+            params.extend([address] * len(addr_cols))
+        else:
+            conds.append("(" + " OR ".join(f"{c} LIKE ?" for c in addr_cols) + ")")
+            params.extend([f"%{address}%"] * len(addr_cols))
+
+    if type_code:
+        conds.append("e.applicant_type_code = ?")
+        params.append(type_code)
+
+    extra = "  AND " + "\n  AND ".join(conds) if conds else ""
+    rows = conn.execute(_SQL_OPERATOR + extra, params).fetchall()
     conn.close()
 
     seen    = set()
@@ -836,95 +1010,32 @@ def find_radius(zipcode, distance_miles=0, fmt="table", outfile=None, db_path=No
             continue
         seen.add(usid)
         result = _row_to_result(row)
-        result["distance_miles"] = in_radius.get(result["zip_code"], "")
+        if in_radius:
+            result["distance_miles"] = in_radius.get(result["zip_code"], "")
         results.append(result)
 
-    results.sort(key=lambda r: (r["distance_miles"], r["call_sign"]))
-    print(f"Found {len(results):,} operators within {distance_miles} miles of {ref_zip} (distances approximate)")
-    _output_results(results, _RADIUS_FIELDS, fmt, outfile)
-
-
-def _register_regexp(conn):
-    conn.create_function("REGEXP", 2,
-        lambda pat, s: bool(re.search(pat, s or "", re.IGNORECASE)))
-
-
-def search_name(query, regex=False, fmt="table", outfile=None, db_path=None):
-    db = Path(db_path or DB_PATH)
-    if not db.exists():
-        sys.exit(f"Database not found: {db}\nRun --pull first.")
-    conn = sqlite3.connect(db)
-    conn.row_factory = sqlite3.Row
-
-    name_expr = (
-        "COALESCE(e.first_name,'') || ' ' || COALESCE(e.mi,'') || ' ' || COALESCE(e.last_name,'')"
-    )
-    if regex:
-        _register_regexp(conn)
-        cond   = f"({name_expr} REGEXP ? OR COALESCE(e.entity_name,'') REGEXP ?)"
-        params = [query, query]
+    if in_radius:
+        results.sort(key=lambda r: (r.get("distance_miles") or 0, r["call_sign"]))
     else:
-        like   = f"%{query}%"
-        cond   = f"({name_expr} LIKE ? OR COALESCE(e.entity_name,'') LIKE ?)"
-        params = [like, like]
+        results.sort(key=lambda r: r["call_sign"])
 
-    rows = conn.execute(_SQL_OPERATOR + f"  AND {cond}", params).fetchall()
-    conn.close()
-
-    seen    = set()
-    results = []
-    for row in rows:
-        usid = row["unique_system_identifier"]
-        if usid in seen:
-            continue
-        seen.add(usid)
-        results.append(_row_to_result(row))
-    results.sort(key=lambda r: r["name"].lower())
-
-    mode = "regex" if regex else "substring"
-    print(f"Name search ({mode}): '{query}'  —  {len(results):,} result(s)")
-    _output_results(results, _SEARCH_FIELDS, fmt, outfile)
-
-
-def search_address(query, regex=False, fmt="table", outfile=None, db_path=None):
-    db = Path(db_path or DB_PATH)
-    if not db.exists():
-        sys.exit(f"Database not found: {db}\nRun --pull first.")
-    conn = sqlite3.connect(db)
-    conn.row_factory = sqlite3.Row
-
-    addr_cols = [
-        "COALESCE(e.street_address,'')",
-        "COALESCE(e.po_box,'')",
-        "COALESCE(e.city,'')",
-        "COALESCE(e.state,'')",
-        "SUBSTR(TRIM(e.zip_code),1,5)",
-    ]
-    if regex:
-        _register_regexp(conn)
-        cond   = "(" + " OR ".join(f"{c} REGEXP ?" for c in addr_cols) + ")"
-        params = [query] * len(addr_cols)
-    else:
-        like   = f"%{query}%"
-        cond   = "(" + " OR ".join(f"{c} LIKE ?" for c in addr_cols) + ")"
-        params = [like] * len(addr_cols)
-
-    rows = conn.execute(_SQL_OPERATOR + f"  AND {cond}", params).fetchall()
-    conn.close()
-
-    seen    = set()
-    results = []
-    for row in rows:
-        usid = row["unique_system_identifier"]
-        if usid in seen:
-            continue
-        seen.add(usid)
-        results.append(_row_to_result(row))
-    results.sort(key=lambda r: (r["state"], r["city"], r["name"].lower()))
-
-    mode = "regex" if regex else "substring"
-    print(f"Address search ({mode}): '{query}'  —  {len(results):,} result(s)")
-    _output_results(results, _SEARCH_FIELDS, fmt, outfile)
+    mode  = "regex" if regex else "substring"
+    parts = []
+    if ref_zip:
+        parts.append(f"zip={ref_zip!r} within {distance_miles} miles")
+    if callsearch:
+        parts.append(f"callsign={callsearch!r}")
+    if name:
+        parts.append(f"name={name!r}")
+    if address:
+        parts.append(f"address={address!r}")
+    if type_code:
+        parts.append(f"type={_APPLICANT_TYPE_NAMES.get(type_code, type_code)!r}")
+    fields = _RADIUS_FIELDS if in_radius else _SEARCH_FIELDS
+    print(f"Search ({mode}): {' AND '.join(parts)}  —  {len(results):,} result(s)")
+    if in_radius:
+        print(f"  (distances approximate, based on ZIP code centroid data)")
+    _output_results(results, fields, fmt, outfile)
 
 
 def _load_full_zip(source_zip, conn):
@@ -961,6 +1072,10 @@ def _pull_daily_local(conn, folder):
         with zipfile.ZipFile(path) as zf:
             n_records, n_usids = _apply_daily_zip(zf, conn)
         print(f"  [{day}] {n_records:,} records, {n_usids:,} licenses updated")
+        conn.execute(
+            "INSERT OR REPLACE INTO _daily_applied (day, etag, applied_at) VALUES (?, ?, ?)",
+            (day, "", datetime.now(timezone.utc).isoformat()),
+        )
         conn.commit()
 
 
@@ -1049,6 +1164,134 @@ def pull(db_path=None, cache_dir=None, force=False, zips_folder=None):
 
     conn.close()
 
+    print("\nSeeding pgeocode ZIP cache ...")
+    try:
+        import pgeocode
+        pgeocode.Nominatim("us")
+        print("  pgeocode cache ready.")
+    except ImportError:
+        print("  pgeocode not installed; skipping (install it to enable --zip radius search).")
+
+
+def _pgeocode_cache_info():
+    """Return info about the pgeocode US postal data cache."""
+    try:
+        import pgeocode  # noqa: F401
+    except ImportError:
+        return {"installed": False}
+
+    cache_dir = None
+    try:
+        import pooch
+        cache_dir = Path(pooch.os_cache("pgeocode"))
+    except (ImportError, Exception):
+        cache_dir = Path.home() / ".cache" / "pgeocode"
+
+    if not cache_dir.exists():
+        return {"installed": True, "cache_dir": cache_dir, "cached": False}
+
+    files = sorted(
+        (f for f in cache_dir.iterdir() if f.is_file()),
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    )
+    if not files:
+        return {"installed": True, "cache_dir": cache_dir, "cached": False}
+
+    newest_mtime = datetime.fromtimestamp(files[0].stat().st_mtime, tz=timezone.utc)
+    total_size   = sum(f.stat().st_size for f in files)
+    return {
+        "installed":   True,
+        "cached":      True,
+        "cache_dir":   cache_dir,
+        "mtime":       newest_mtime,
+        "file_count":  len(files),
+        "total_size":  total_size,
+    }
+
+
+def show_status(db_path=None, cache_dir=None):
+    db       = Path(db_path   or DB_PATH)
+    cdir     = Path(cache_dir or CACHE_DIR)
+    lw       = 22
+
+    # ── Database ──────────────────────────────────────────────────────────────
+    print(f"\nDatabase: {db}")
+    if not db.exists():
+        print("  Not found — run --pull first.")
+    else:
+        size_mb = db.stat().st_size / 1_048_576
+        print(f"  {'Size':<{lw}} {size_mb:.1f} MB")
+
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+
+        meta = {r["key"]: r["value"]
+                for r in conn.execute("SELECT key, value FROM _meta").fetchall()}
+
+        snapshot = meta.get("snapshot_date", "")
+        last_pull = meta.get("last_pull", "")
+        print(f"  {'Snapshot date':<{lw}} {snapshot[:16] + ' UTC' if snapshot else 'unknown'}")
+        print(f"  {'Last pull':<{lw}} {last_pull[:16] + ' UTC' if last_pull else 'unknown'}")
+
+        daily_rows = conn.execute(
+            "SELECT day, etag, applied_at FROM _daily_applied ORDER BY applied_at"
+        ).fetchall()
+        if daily_rows:
+            days_str  = ", ".join(r["day"] for r in daily_rows)
+            latest_at = max((r["applied_at"] or "") for r in daily_rows)
+            print(f"  {'Daily updates':<{lw}} {days_str}")
+            print(f"  {'  last applied':<{lw}} {latest_at[:16] + ' UTC' if latest_at else 'unknown'}")
+        else:
+            print(f"  {'Daily updates':<{lw}} none applied")
+
+        print()
+        table_labels = [
+            ("license_header", "License headers"),
+            ("entity",         "Entity records"),
+            ("amateur",        "Amateur records"),
+            ("history",        "History entries"),
+            ("comments",       "Comments"),
+        ]
+        print(f"  {'Table':<24} {'Records':>14}")
+        print(f"  {'─' * 24} {'─' * 14}")
+        for table, label in table_labels:
+            try:
+                n = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+                print(f"  {label:<24} {n:>14,}")
+            except sqlite3.OperationalError:
+                print(f"  {label:<24} {'(missing)':>14}")
+        conn.close()
+
+    # ── Weekly snapshot cache file ─────────────────────────────────────────────
+    cache_zip  = cdir / "l_amat.zip"
+    etag_file  = cdir / "l_amat.etag"
+    print(f"\nWeekly snapshot cache: {cache_zip}")
+    if cache_zip.exists():
+        zip_mb    = cache_zip.stat().st_size / 1_048_576
+        zip_mtime = datetime.fromtimestamp(cache_zip.stat().st_mtime, tz=timezone.utc)
+        etag      = etag_file.read_text().strip() if etag_file.exists() else "(none)"
+        print(f"  {'Size':<{lw}} {zip_mb:.1f} MB")
+        print(f"  {'Downloaded':<{lw}} {_fmt_dt(zip_mtime)}")
+        print(f"  {'ETag':<{lw}} {etag}")
+    else:
+        print("  Not downloaded — run --pull first.")
+
+    # ── pgeocode ZIP cache ─────────────────────────────────────────────────────
+    geo = _pgeocode_cache_info()
+    print(f"\npgeocode ZIP cache:")
+    if not geo["installed"]:
+        print("  Not installed — install pgeocode to enable --zip radius search.")
+    elif not geo.get("cached"):
+        print(f"  Installed but not seeded — run --pull to cache ZIP data.")
+        print(f"  {'Cache path':<{lw}} {geo.get('cache_dir', 'unknown')}")
+    else:
+        size_kb = geo["total_size"] / 1024
+        print(f"  {'Cached':<{lw}} {_fmt_dt(geo['mtime'])}")
+        print(f"  {'Cache path':<{lw}} {geo['cache_dir']}")
+        print(f"  {'Files':<{lw}} {geo['file_count']}  ({size_kb:.0f} KB)")
+    print()
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1062,6 +1305,10 @@ def main():
     )
 
     # --- Data management ---
+    parser.add_argument(
+        "--status", action="store_true",
+        help="Show the state of the local database, cached FCC files, and pgeocode ZIP data",
+    )
     parser.add_argument(
         "--pull", action="store_true",
         help="Download FCC amateur radio license data and load into SQLite",
@@ -1079,7 +1326,19 @@ def main():
     # --- Queries ---
     parser.add_argument(
         "--call", metavar="CALLSIGN",
-        help="Look up a callsign and display a formatted operator profile",
+        help="Look up a single callsign and display a formatted operator profile (exact match)",
+    )
+    parser.add_argument(
+        "--history", action="store_true",
+        help="With --call: append a compact table of all past licensees for the callsign, most recent first",
+    )
+    parser.add_argument(
+        "--full-history", action="store_true",
+        help="With --call: show full formatted records for every past licensee, separated by 'Record X of Y' banners",
+    )
+    parser.add_argument(
+        "--callsearch", metavar="QUERY",
+        help="Search active operators by callsign (substring or --regex); returns a list",
     )
     parser.add_argument(
         "--zip", metavar="ZIPCODE",
@@ -1095,8 +1354,15 @@ def main():
         help="Search active operators by any part of mailing address (substring or --regex)",
     )
     parser.add_argument(
+        "--type", metavar="TYPE",
+        help=(
+            "Filter by entity type: individual, club, races, military, government "
+            "(or raw FCC code: I, B, R, M, G). Can be combined with --name, --address, --callsearch."
+        ),
+    )
+    parser.add_argument(
         "--regex", action="store_true",
-        help="Treat --name / --address query as a Python regular expression",
+        help="Treat --callsearch / --name / --address query as a Python regular expression",
     )
     parser.add_argument(
         "--radius-miles", type=float, default=0, metavar="MILES",
@@ -1141,18 +1407,24 @@ def main():
     args = parser.parse_args()
     fmt  = args.fmt
 
-    if args.pull:
+    type_code = None
+    if args.type:
+        lower = args.type.lower()
+        type_code = _TYPE_CODES.get(lower, args.type.upper())
+
+    if args.status:
+        show_status(db_path=args.db, cache_dir=args.cache_dir)
+    elif args.pull:
         pull(db_path=args.db, cache_dir=args.cache_dir, force=args.force,
              zips_folder=args.zips_folder)
-    elif args.zip:
-        find_radius(args.zip, distance_miles=args.radius_miles,
-                    fmt=fmt, outfile=args.file, db_path=args.db)
-    elif args.name:
-        search_name(args.name, regex=args.regex, fmt=fmt, outfile=args.file, db_path=args.db)
-    elif args.address:
-        search_address(args.address, regex=args.regex, fmt=fmt, outfile=args.file, db_path=args.db)
+    elif args.zip or args.name or args.address or args.callsearch or type_code:
+        search_multi(callsearch=args.callsearch, name=args.name, address=args.address,
+                     type_code=type_code, zipcode=args.zip,
+                     distance_miles=args.radius_miles,
+                     regex=args.regex, fmt=fmt, outfile=args.file, db_path=args.db)
     elif args.call:
-        lookup(args.call, db_path=args.db)
+        lookup(args.call, db_path=args.db, show_history=args.history,
+               show_full_history=args.full_history)
     else:
         parser.print_help()
 
