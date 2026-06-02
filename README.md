@@ -438,6 +438,71 @@ hamdat --zip 10001 --radius-miles 50 --callsearch "^W2" --regex --type club
 
 ---
 
+### Understanding `--regex`
+
+By default, `--callsearch`, `--name`, and `--address` do a simple **substring** search — if the query appears anywhere in the field, it matches. Adding `--regex` switches to **regular expression** matching, which lets you describe a pattern instead of just a fixed string.
+
+A regular expression (regex) is a mini-language for matching text patterns. If you've never used them before, here are the most useful pieces:
+
+| Pattern | Meaning | Example | Matches |
+|---|---|---|---|
+| `^` | Start of the value | `^W2` | `W2ABC`, `W2XY` — but not `KW2A` |
+| `$` | End of the value | `K$` | `W1K`, `N2K` — but not `K2TTA` |
+| `^...$` | Exact full match | `^W2ABC$` | Only `W2ABC` |
+| `.` | Any single character | `W.ABC` | `W1ABC`, `W2ABC`, `WXABC` |
+| `[ABC]` | Any one of these characters | `^[KWN]2` | Calls starting with K2, W2, or N2 |
+| `[0-9]` | Any digit | `[0-9]ABC` | `1ABC`, `5ABC`, etc. |
+| `*` | Zero or more of the previous | `KD*A` | `KA`, `KDA`, `KDDA` |
+| `+` | One or more of the previous | `KD+A` | `KDA`, `KDDA` — but not `KA` |
+| `{n}` | Exactly n of the previous | `[A-Z]{3}$` | Ends in exactly 3 letters |
+| `(A\|B)` | A or B | `^(K\|W)2` | Starts with K2 or W2 |
+
+**Callsign pattern examples:**
+
+```
+# Calls that start with W2 (^ = beginning of value)
+hamdat --callsearch "^W2" --regex
+
+# Calls that end in K ($ = end of value)
+hamdat --callsearch "K$" --regex
+
+# Exact 1x1 format calls (one letter, one digit, one letter — e.g. W2A, K1Z)
+hamdat --callsearch "^[A-Z][0-9][A-Z]$" --regex
+
+# All 2x3 format calls in district 2 (e.g. KD2ABC, WB2XYZ)
+hamdat --callsearch "^[A-Z]{2}2[A-Z]{3}$" --regex
+
+# Calls starting with K2 or W2
+hamdat --callsearch "^(K|W)2" --regex
+```
+
+**Name pattern examples:**
+
+```
+# Last name starting with Smith (^ matches the beginning)
+hamdat --name "^Smith" --regex
+
+# Full name exactly "John Smith"
+hamdat --name "^John Smith$" --regex
+
+# Names containing "Radio" followed by anything, then "Club" or "Society"
+hamdat --name "Radio.*(Club|Society)" --regex
+```
+
+**Address pattern examples:**
+
+```
+# Connecticut ZIP codes (all start with 06)
+hamdat --address "^06[0-9]{3}$" --regex
+
+# Any of CT, NY, or NJ in the state field
+hamdat --address "^(CT|NY|NJ)$" --regex
+```
+
+For the full regular expression reference, see the [Python regex documentation](https://docs.python.org/3/library/re.html).
+
+---
+
 ### Combining search flags — AND logic
 
 When multiple search flags are specified together, results must satisfy **all** conditions (AND, not OR):
