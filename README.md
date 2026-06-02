@@ -520,7 +520,7 @@ hamdat --callsearch "^W2" --regex --type club
 # Name contains "Radio", callsign starts with W, in New Jersey
 hamdat --name "Radio" --callsearch "^W" --address "NJ"
 
-# Extra class operators named Johnson
+# Operators named "Johnson" with a callsign that begins with N
 hamdat --name "Johnson" --callsearch "^N" --regex
 ```
 
