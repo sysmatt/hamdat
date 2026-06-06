@@ -21,6 +21,7 @@ import csv
 import io
 import json
 import re
+import shutil
 import sqlite3
 import sys
 import zipfile
@@ -325,7 +326,7 @@ def _apply_daily_zip(zf, conn):
     return n_records, len(changed_usids)
 
 
-def _pull_daily(conn, force=False):
+def _pull_daily(conn, force=False, keep_sources=None):
     """Check all 7 FCC daily change files and apply any that are newer than the DB snapshot."""
     # Snapshot date: when the weekly full file was last generated (from its Last-Modified header)
     row = conn.execute("SELECT value FROM _meta WHERE key = 'snapshot_date'").fetchone()
@@ -382,6 +383,8 @@ def _pull_daily(conn, force=False):
 
     for _lm, day, url, remote_etag in candidates:
         cache_zip = CACHE_DIR / f"l_am_{day}.zip"
+        if keep_sources is not None:
+            _rotate_backup(cache_zip, keep_sources)
         _download(url, cache_zip)
         with zipfile.ZipFile(cache_zip) as zf:
             n_records, n_usids = _apply_daily_zip(zf, conn)
@@ -480,24 +483,25 @@ def _date_cond(col, spec):
     """Return (sql_fragment, params_list) for a date filter spec against an ISO col expression.
 
     Formats:
-      YYYY-MM-DD             exact date
-      YYYY-MM-DD:YYYY-MM-DD  inclusive range (relative dates work too: -90:-30)
-      >YYYY-MM-DD            strictly after
-      >=YYYY-MM-DD           on or after
-      <YYYY-MM-DD            strictly before
-      <=YYYY-MM-DD           on or before
-      -N                     last N days (BETWEEN today-N AND today)
-      +N                     next N days (BETWEEN today AND today+N)
+      YYYY-MM-DD               exact date
+      YYYY-MM-DD:YYYY-MM-DD    inclusive range (relative dates work too: -90:-30)
+      since:YYYY-MM-DD         on or after DATE  — DATE itself IS included
+      after:YYYY-MM-DD         strictly after DATE — DATE itself is NOT included
+      thru:YYYY-MM-DD          on or before DATE — DATE itself IS included
+      before:YYYY-MM-DD        strictly before DATE — DATE itself is NOT included
+      -N                       last N days (BETWEEN today-N AND today)
+      +N                       next N days (BETWEEN today AND today+N)
     """
     spec = spec.strip()
-    if spec.startswith('>='):
-        return f"{col} >= ?", [_resolve_date_str(spec[2:])]
-    if spec.startswith('<='):
-        return f"{col} <= ?", [_resolve_date_str(spec[2:])]
-    if spec.startswith('>'):
-        return f"{col} > ?", [_resolve_date_str(spec[1:])]
-    if spec.startswith('<'):
-        return f"{col} < ?", [_resolve_date_str(spec[1:])]
+    # Word-prefix comparisons must be checked before the ':' range check
+    if spec.startswith('since:'):
+        return f"{col} >= ?", [_resolve_date_str(spec[6:])]
+    if spec.startswith('thru:'):
+        return f"{col} <= ?", [_resolve_date_str(spec[5:])]
+    if spec.startswith('after:'):
+        return f"{col} > ?", [_resolve_date_str(spec[6:])]
+    if spec.startswith('before:'):
+        return f"{col} < ?", [_resolve_date_str(spec[7:])]
     if ':' in spec:
         lo_s, hi_s = spec.split(':', 1)
         lo, hi = _resolve_date_str(lo_s), _resolve_date_str(hi_s)
@@ -1198,7 +1202,27 @@ def _pull_daily_local(conn, folder):
         conn.commit()
 
 
-def pull(db_path=None, cache_dir=None, force=False, zips_folder=None):
+def _rotate_backup(path, keep_n):
+    """Copy path to a timestamped sibling, then purge old backups of that stem beyond keep_n."""
+    p = Path(path)
+    if not p.exists():
+        return
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    if keep_n > 0:
+        dest = p.parent / f"{p.stem}-{timestamp}{p.suffix}"
+        shutil.copy2(p, dest)
+        print(f"  Backed up to {dest.name}")
+    pattern = re.compile(rf'^{re.escape(p.stem)}-\d{{14}}{re.escape(p.suffix)}$')
+    backups = sorted(
+        [f for f in p.parent.iterdir() if pattern.match(f.name)],
+        key=lambda f: f.name, reverse=True,
+    )
+    for old in backups[keep_n:]:
+        old.unlink()
+        print(f"  Purged old backup: {old.name}")
+
+
+def pull(db_path=None, cache_dir=None, force=False, zips_folder=None, keep_db=None, keep_sources=None):
     global CACHE_DIR, DB_PATH, CACHE_ZIP, ETAG_FILE
 
     if cache_dir:
@@ -1209,6 +1233,10 @@ def pull(db_path=None, cache_dir=None, force=False, zips_folder=None):
         DB_PATH = Path(db_path)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if keep_db is not None:
+        print("\nDatabase backup:")
+        _rotate_backup(DB_PATH, keep_db)
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -1258,6 +1286,9 @@ def pull(db_path=None, cache_dir=None, force=False, zips_folder=None):
                 print("  → no cached copy found; downloading full dataset")
             else:
                 print("  → ETag changed; downloading updated full dataset")
+            if keep_sources is not None:
+                print("\nSource backup (weekly):")
+                _rotate_backup(CACHE_ZIP, keep_sources)
             _download(FCC_AMAT_URL, CACHE_ZIP)
             if remote_etag:
                 ETAG_FILE.write_text(remote_etag)
@@ -1279,7 +1310,7 @@ def pull(db_path=None, cache_dir=None, force=False, zips_folder=None):
         else:
             _create_schema(conn)  # Ensures new tables/indexes exist on schema upgrades
 
-        _pull_daily(conn, force=force)
+        _pull_daily(conn, force=force, keep_sources=keep_sources)
 
     conn.close()
 
@@ -1441,6 +1472,20 @@ def main():
         help="Load FCC zip files from a local folder instead of downloading "
              "(expects l_amat.zip; optional l_am_sun.zip … l_am_sat.zip for daily updates)",
     )
+    parser.add_argument(
+        "--keep-db", metavar="N", nargs="?", const=1, default=None, type=int,
+        help="Before pulling, copy the database to a timestamped backup "
+             "(e.g. hamdat-20260606143022.db) and keep only the N most recent copies. "
+             "--keep-db alone keeps 1; --keep-db 0 purges all existing backups. "
+             "Note: each backup is ~500 MB.",
+    )
+    parser.add_argument(
+        "--keep-sources", metavar="N", nargs="?", const=1, default=None, type=int,
+        help="Before downloading, copy each FCC zip (weekly snapshot and daily files) to a "
+             "timestamped backup (e.g. l_amat-20260606143022.zip) and keep only the N most "
+             "recent copies per file. --keep-sources alone keeps 1; --keep-sources 0 purges "
+             "all existing source backups. Only applies in remote (non --zips-folder) mode.",
+    )
 
     # --- Queries ---
     parser.add_argument(
@@ -1491,17 +1536,19 @@ def main():
         "--grant-date", metavar="DATESPEC",
         help=(
             "Filter by license grant date. "
-            "Formats: YYYY-MM-DD (exact), YYYY-MM-DD:YYYY-MM-DD (range), "
-            ">YYYY-MM-DD / >=YYYY-MM-DD / <YYYY-MM-DD / <=YYYY-MM-DD, "
-            "-N (last N days), +N (next N days), -90:-30 (relative range). "
-            "Example: --grant-date -30  lists licenses granted in the last 30 days."
+            "Formats: YYYY-MM-DD (exact); YYYY-MM-DD:YYYY-MM-DD (inclusive range); "
+            "since:DATE (on or after, DATE included); after:DATE (strictly after, DATE excluded); "
+            "thru:DATE (on or before, DATE included); before:DATE (strictly before, DATE excluded); "
+            "-N (last N days); +N (next N days); -90:-30 (relative range). "
+            "Example: --grant-date -30"
         ),
     )
     parser.add_argument(
         "--change-date", metavar="DATESPEC",
         help=(
-            "Filter by last action/change date (same format as --grant-date). "
-            "Example: --change-date -7  shows licenses with activity in the last week."
+            "Filter by last action/change date. Accepts the same DATESPEC formats as --grant-date: "
+            "since:/after:/thru:/before: prefixes, exact date, range, or relative -N/+N days. "
+            "Example: --change-date -7"
         ),
     )
     parser.add_argument(
@@ -1567,7 +1614,8 @@ def main():
         show_status(db_path=args.db, cache_dir=args.cache_dir)
     elif args.pull:
         pull(db_path=args.db, cache_dir=args.cache_dir, force=args.force,
-             zips_folder=args.zips_folder)
+             zips_folder=args.zips_folder, keep_db=args.keep_db,
+             keep_sources=args.keep_sources)
     elif (args.zip or args.name or args.address or args.callsearch or type_code
           or op_class or args.grant_date or args.change_date):
         search_multi(callsearch=args.callsearch, name=args.name, address=args.address,

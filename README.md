@@ -35,7 +35,7 @@ cp hamdat ~/bin/      # or anywhere on your PATH
 ## Usage
 
 ```
-hamdat [--pull] [--status] [--call CALLSIGN] [--callsearch QUERY] [--zip ZIPCODE] [--name QUERY] [--address QUERY] [--type TYPE] [--class CLASS] [--grant-date DATESPEC] [--change-date DATESPEC] [options]
+hamdat [--pull] [--status] [--call CALLSIGN] [--callsearch QUERY] [--zip ZIPCODE] [--name QUERY] [--address QUERY] [--type TYPE] [--class CLASS] [--grant-date DATESPEC] [--change-date DATESPEC] [--keep-db [N]] [--keep-sources [N]] [options]
 ```
 
 ### Options
@@ -48,6 +48,8 @@ hamdat [--pull] [--status] [--call CALLSIGN] [--callsearch QUERY] [--zip ZIPCODE
 | `--force` | Force re-download of the full dataset even if the cached copy is current |
 | `--zips-folder DIR` | Load FCC zip files from a local folder instead of downloading |
 | `--status` | Show the state of the local database, cached FCC files, and pgeocode ZIP data |
+| `--keep-db [N]` | Before pulling, rotate a timestamped backup of the database; keep N copies (default 1). `--keep-db 0` purges all existing backups. |
+| `--keep-sources [N]` | Before downloading, rotate timestamped backups of each FCC zip file; keep N copies (default 1). `--keep-sources 0` purges all existing source backups. |
 
 **Queries**
 
@@ -151,6 +153,41 @@ hamdat --pull --force
 
 Re-downloads the full weekly snapshot regardless of ETag, drops and reloads all tables, then applies daily updates. Useful after a schema change or suspected data corruption.
 
+### Keeping backups — `--keep-db` and `--keep-sources`
+
+Both flags follow the same rotation model: before anything is overwritten, a timestamped copy is made in the same directory. The N most recent copies are retained and anything older is purged automatically. The filename is derived from the original — no hardcoded names.
+
+| Flag | Backs up | Example backup filename |
+|---|---|---|
+| `--keep-db [N]` | `hamdat.db` (~500 MB each) | `hamdat-20260606143022.db` |
+| `--keep-sources [N]` | `l_amat.zip` + each daily `l_am_*.zip` | `l_amat-20260606143022.zip` |
+
+**`--keep-db` — database rotation**
+
+```
+hamdat --pull --keep-db        # keep 1 backup (default)
+hamdat --pull --keep-db 3      # rolling rotation of 3 database backups
+hamdat --pull --keep-db 0      # purge all existing database backups, make no new one
+```
+
+**`--keep-sources` — source zip rotation**
+
+```
+hamdat --pull --keep-sources       # keep 1 backup of each zip (default)
+hamdat --pull --keep-sources 2     # keep 2 copies of each zip file
+hamdat --pull --keep-sources 0     # purge all existing zip backups
+```
+
+`--keep-sources` only applies in remote mode — it has no effect with `--zips-folder`.
+
+**Using both together**
+
+```
+hamdat --pull --keep-db 3 --keep-sources 2
+```
+
+With a custom `--db` path the backup filenames follow the same stem: `--db /data/myradio.db` produces `myradio-20260606143022.db`. This means `--keep-sources 2` with 7 daily files plus the weekly retains up to 16 zip files total in the cache directory — factor that into available disk space.
+
 ---
 
 ## Offline Operations
@@ -161,8 +198,8 @@ hamdat is designed to work fully offline after an initial setup. Understanding w
 
 | Operation | Network required |
 |---|---|
-| `--pull` (remote mode) | Yes — downloads FCC snapshot and daily files |
-| `--pull --zips-folder` | No — reads from local files only |
+| `--pull` (remote mode) | Yes — downloads FCC snapshot and daily files (`--keep-db`, `--keep-sources` follow this mode) |
+| `--pull --zips-folder` | No — reads from local files only (`--keep-db` works here; `--keep-sources` has no effect) |
 | `--call`, `--callsearch`, `--name`, `--address`, `--type`, `--class`, `--grant-date`, `--change-date` | No |
 | `--zip` radius search (after first use) | No |
 | `--zip` radius search (first ever use) | Yes — one-time pgeocode data download (~1 MB) |
@@ -449,17 +486,33 @@ Filter active licenses by when they were granted (`--grant-date`) or when any FC
 
 #### Date query language
 
-| Format | Meaning | Example |
+| Format | Meaning | Boundary date |
 |---|---|---|
-| `YYYY-MM-DD` | Exact date | `2025-03-15` |
-| `YYYY-MM-DD:YYYY-MM-DD` | Inclusive range | `2025-01-01:2025-12-31` |
-| `>YYYY-MM-DD` | Strictly after | `>2025-06-01` |
-| `>=YYYY-MM-DD` | On or after | `>=2025-01-01` |
-| `<YYYY-MM-DD` | Strictly before | `<2020-01-01` |
-| `<=YYYY-MM-DD` | On or before | `<=2024-12-31` |
-| `-N` | Last N days (BETWEEN today−N AND today) | `-30` |
-| `+N` | Next N days (BETWEEN today AND today+N) | `+14` |
-| `-M:-N` | Relative range (M days ago to N days ago) | `-90:-30` |
+| `YYYY-MM-DD` | Exact date | — |
+| `YYYY-MM-DD:YYYY-MM-DD` | Inclusive range (both ends included) | included |
+| `since:YYYY-MM-DD` | On or after DATE | **included** |
+| `after:YYYY-MM-DD` | Strictly after DATE | **excluded** |
+| `thru:YYYY-MM-DD` | On or before DATE | **included** |
+| `before:YYYY-MM-DD` | Strictly before DATE | **excluded** |
+| `-N` | Last N days (BETWEEN today−N AND today) | — |
+| `+N` | Next N days (BETWEEN today AND today+N) | — |
+| `-M:-N` | Relative range (M days ago to N days ago) | — |
+
+**`since` vs `after` — on or after vs strictly after**
+
+Both filter for dates in the future direction, but differ on whether the boundary date itself counts:
+
+- `since:2025-01-01` — matches January 1 and everything after. Use this when you mean *"starting from this date"*.
+- `after:2025-01-01` — matches only January 2 onwards. January 1 itself is excluded. Use this when you mean *"later than this date"*.
+
+**`thru` vs `before` — on or before vs strictly before**
+
+Both filter for dates in the past direction, with the same inclusive/exclusive distinction:
+
+- `thru:2024-12-31` — matches December 31 and everything before. Use this when you mean *"up through and including this date"*.
+- `before:2024-12-31` — matches only up to December 30. December 31 itself is excluded. Use this when you mean *"earlier than this date"*.
+
+> **Rule of thumb:** `since` and `thru` include the boundary date. `after` and `before` do not.
 
 Relative dates (`-N`, `+N`) can also appear on either side of `:` in a range: `-90:2025-12-31` is valid.
 
@@ -471,19 +524,25 @@ Relative dates (`-N`, `+N`) can also appear on either side of `:` in a range: `-
 # Licenses granted in the last 30 days
 hamdat --grant-date -30
 
-# Licenses granted in the last 90 days
-hamdat --grant-date -90
-
 # Licenses granted on a specific date
 hamdat --grant-date 2025-03-15
 
-# Licenses granted during a calendar year
-hamdat --grant-date 2024-01-01:2024-12-31
+# Licenses granted during a calendar year (both endpoints included)
+hamdat --grant-date 2025-01-01:2025-12-31
 
-# Licenses granted since a specific date
-hamdat --grant-date >=2025-01-01
+# Licenses granted from Jan 1 onward — Jan 1 IS included
+hamdat --grant-date since:2025-01-01
 
-# Licenses granted between 90 and 30 days ago (older new grants)
+# Licenses granted strictly after Jan 1 — Jan 1 is NOT included
+hamdat --grant-date after:2025-01-01
+
+# Licenses granted up through Dec 31 — Dec 31 IS included
+hamdat --grant-date thru:2024-12-31
+
+# Licenses granted strictly before Dec 31 — Dec 31 is NOT included
+hamdat --grant-date before:2024-12-31
+
+# Licenses granted between 90 and 30 days ago
 hamdat --grant-date -90:-30
 ```
 
@@ -493,8 +552,8 @@ hamdat --grant-date -90:-30
 # Any license with FCC action in the last 7 days
 hamdat --change-date -7
 
-# Licenses with changes since the start of the year
-hamdat --change-date >=2025-01-01
+# Licenses with changes from the start of the year onward (Jan 1 included)
+hamdat --change-date since:2025-01-01
 ```
 
 ---
@@ -519,8 +578,8 @@ hamdat --class T --grant-date -90 --zip 07030 --radius-miles 50
 # Recent grants to individuals named Smith
 hamdat --grant-date -30 --name "Smith" --type individual
 
-# Any license with a callsign starting with W2 granted this year
-hamdat --callsearch "^W2" --regex --grant-date >=2025-01-01
+# W2 callsigns granted from the start of this year (Jan 1 included)
+hamdat --callsearch "^W2" --regex --grant-date since:2025-01-01
 
 # Export new Technicians from the last 30 days to CSV
 hamdat --class T --grant-date -30 --csv --file new_techs.csv
