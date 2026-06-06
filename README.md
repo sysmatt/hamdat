@@ -35,7 +35,7 @@ cp hamdat ~/bin/      # or anywhere on your PATH
 ## Usage
 
 ```
-hamdat [--pull] [--status] [--call CALLSIGN] [--callsearch QUERY] [--zip ZIPCODE] [--name QUERY] [--address QUERY] [--type TYPE] [options]
+hamdat [--pull] [--status] [--call CALLSIGN] [--callsearch QUERY] [--zip ZIPCODE] [--name QUERY] [--address QUERY] [--type TYPE] [--class CLASS] [--grant-date DATESPEC] [--change-date DATESPEC] [options]
 ```
 
 ### Options
@@ -60,6 +60,9 @@ hamdat [--pull] [--status] [--call CALLSIGN] [--callsearch QUERY] [--zip ZIPCODE
 | `--name QUERY` | Search active operators by name (substring or `--regex`) |
 | `--address QUERY` | Search active operators by any part of mailing address (substring or `--regex`) |
 | `--type TYPE` | Filter by entity type: `individual`, `club`, `races`, `military`, `government` (or raw FCC code) |
+| `--class CLASS [...]` | Filter by operator class: `T` `G` `E` `A` `N` `P` or full name. Multiple values allowed. |
+| `--grant-date DATESPEC` | Filter by license grant date (see [Date query language](#date-query-language)) |
+| `--change-date DATESPEC` | Filter by last action/change date (same format as `--grant-date`) |
 | `--zip ZIPCODE` | Find active operators near a ZIP code (see `--radius-miles`) |
 | `--radius-miles MILES` | Search radius for `--zip`; `0` = exact ZIP only (default: `0`) |
 | `--regex` | Treat `--callsearch` / `--name` / `--address` as a Python regular expression |
@@ -160,7 +163,7 @@ hamdat is designed to work fully offline after an initial setup. Understanding w
 |---|---|
 | `--pull` (remote mode) | Yes — downloads FCC snapshot and daily files |
 | `--pull --zips-folder` | No — reads from local files only |
-| `--call`, `--callsearch`, `--name`, `--address`, `--type` | No |
+| `--call`, `--callsearch`, `--name`, `--address`, `--type`, `--class`, `--grant-date`, `--change-date` | No |
 | `--zip` radius search (after first use) | No |
 | `--zip` radius search (first ever use) | Yes — one-time pgeocode data download (~1 MB) |
 | `--status` | No |
@@ -414,6 +417,120 @@ hamdat --type B                              # raw FCC code also works
 
 ---
 
+### `--class` — Filter by operator class
+
+Filters results by FCC operator class. Accepts single-letter FCC codes or full names (case-insensitive). Multiple values may be given; results matching **any** of the specified classes are returned (OR within `--class`, AND with every other flag).
+
+| Code | Full name |
+|---|---|
+| `T` | Technician |
+| `G` | General |
+| `E` | Amateur Extra |
+| `A` | Advanced |
+| `N` | Novice |
+| `P` | Technician Plus |
+
+```
+hamdat --class T                             # all active Technicians
+hamdat --class E                             # all active Amateur Extras
+hamdat --class T G                           # Technicians and Generals
+hamdat --class technician                    # full name also works
+hamdat --class extra --address "CT"          # Extras in Connecticut
+hamdat --class T --name "Smith"              # Technicians named Smith
+```
+
+---
+
+### `--grant-date` and `--change-date` — Date filters
+
+Filter active licenses by when they were granted (`--grant-date`) or when any FCC action last occurred (`--change-date`). Both accept the same flexible date query language and AND with all other search flags.
+
+---
+
+#### Date query language
+
+| Format | Meaning | Example |
+|---|---|---|
+| `YYYY-MM-DD` | Exact date | `2025-03-15` |
+| `YYYY-MM-DD:YYYY-MM-DD` | Inclusive range | `2025-01-01:2025-12-31` |
+| `>YYYY-MM-DD` | Strictly after | `>2025-06-01` |
+| `>=YYYY-MM-DD` | On or after | `>=2025-01-01` |
+| `<YYYY-MM-DD` | Strictly before | `<2020-01-01` |
+| `<=YYYY-MM-DD` | On or before | `<=2024-12-31` |
+| `-N` | Last N days (BETWEEN today−N AND today) | `-30` |
+| `+N` | Next N days (BETWEEN today AND today+N) | `+14` |
+| `-M:-N` | Relative range (M days ago to N days ago) | `-90:-30` |
+
+Relative dates (`-N`, `+N`) can also appear on either side of `:` in a range: `-90:2025-12-31` is valid.
+
+---
+
+#### `--grant-date` examples
+
+```
+# Licenses granted in the last 30 days
+hamdat --grant-date -30
+
+# Licenses granted in the last 90 days
+hamdat --grant-date -90
+
+# Licenses granted on a specific date
+hamdat --grant-date 2025-03-15
+
+# Licenses granted during a calendar year
+hamdat --grant-date 2024-01-01:2024-12-31
+
+# Licenses granted since a specific date
+hamdat --grant-date >=2025-01-01
+
+# Licenses granted between 90 and 30 days ago (older new grants)
+hamdat --grant-date -90:-30
+```
+
+#### `--change-date` examples
+
+```
+# Any license with FCC action in the last 7 days
+hamdat --change-date -7
+
+# Licenses with changes since the start of the year
+hamdat --change-date >=2025-01-01
+```
+
+---
+
+#### Combining date filters with other search flags — "new ham" queries
+
+Because all flags are ANDed, date and class filters compose freely with name, address, callsign, ZIP, and type filters:
+
+```
+# Newly granted Technicians (last 60 days) — the "new ham" query
+hamdat --class T --grant-date -60
+
+# New Technicians or Generals in the last 30 days
+hamdat --class T G --grant-date -30
+
+# New Technicians in New Jersey
+hamdat --class T --grant-date -90 --address "NJ"
+
+# New Technicians within 50 miles of a ZIP code
+hamdat --class T --grant-date -90 --zip 07030 --radius-miles 50
+
+# Recent grants to individuals named Smith
+hamdat --grant-date -30 --name "Smith" --type individual
+
+# Any license with a callsign starting with W2 granted this year
+hamdat --callsearch "^W2" --regex --grant-date >=2025-01-01
+
+# Export new Technicians from the last 30 days to CSV
+hamdat --class T --grant-date -30 --csv --file new_techs.csv
+
+# Export new Technicians from the last 30 days to HTML
+hamdat --class T --grant-date -30 --html --file new_techs.html
+```
+
+---
+
 ### `--zip` — Find operators by ZIP code
 
 Finds all active license holders within the specified radius of a ZIP code.
@@ -505,7 +622,7 @@ For the full regular expression reference, see the [Python regex documentation](
 
 ### Combining search flags — AND logic
 
-When multiple search flags are specified together, results must satisfy **all** conditions (AND, not OR):
+When multiple search flags are specified together, results must satisfy **all** conditions (AND, not OR). All flags — including `--class`, `--grant-date`, and `--change-date` — participate in this AND logic:
 
 ```
 # Clubs within 20 miles of ZIP 07848
@@ -522,13 +639,22 @@ hamdat --name "Radio" --callsearch "^W" --address "NJ"
 
 # Operators named "Johnson" with a callsign that begins with N
 hamdat --name "Johnson" --callsearch "^N" --regex
+
+# Newly granted Technicians in the last 30 days — the "new ham" query
+hamdat --class T --grant-date -30
+
+# New Technicians or Generals in Connecticut in the last 60 days
+hamdat --class T G --grant-date -60 --address "CT"
+
+# Extra class licenses granted within the last year
+hamdat --class E --grant-date >=2025-01-01
 ```
 
 ---
 
 ## Output formats
 
-All tabular commands (`--callsearch`, `--name`, `--address`, `--type`, `--zip`) support four output formats:
+All tabular search commands (`--callsearch`, `--name`, `--address`, `--type`, `--class`, `--grant-date`, `--change-date`, `--zip`) support four output formats:
 
 | Flag | Destination | Default filename |
 |---|---|---|
