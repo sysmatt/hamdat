@@ -1010,6 +1010,7 @@ def search_multi(callsearch=None, name=None, address=None, type_code=None,
         except ImportError:
             sys.exit("Install pgeocode: pip install pgeocode")
 
+        pgeocode.STORAGE_DIR = str(db.parent / "pgeocode")
         ref_zip = zipcode.strip().zfill(5)
         nomi    = pgeocode.Nominatim("us")
         ref     = nomi.query_postal_code(ref_zip)
@@ -1317,25 +1318,21 @@ def pull(db_path=None, cache_dir=None, force=False, zips_folder=None, keep_db=No
     print("\nSeeding pgeocode ZIP cache ...")
     try:
         import pgeocode
+        pgeocode.STORAGE_DIR = str(DB_PATH.parent / "pgeocode")
         pgeocode.Nominatim("us")
         print("  pgeocode cache ready.")
     except ImportError:
         print("  pgeocode not installed; skipping (install it to enable --zip radius search).")
 
 
-def _pgeocode_cache_info():
+def _pgeocode_cache_info(db_path=None):
     """Return info about the pgeocode US postal data cache."""
     try:
         import pgeocode  # noqa: F401
     except ImportError:
         return {"installed": False}
 
-    cache_dir = None
-    try:
-        import pooch
-        cache_dir = Path(pooch.os_cache("pgeocode"))
-    except (ImportError, Exception):
-        cache_dir = Path.home() / ".cache" / "pgeocode"
+    cache_dir = Path(db_path or DB_PATH).parent / "pgeocode"
 
     if not cache_dir.exists():
         return {"installed": True, "cache_dir": cache_dir, "cached": False}
@@ -1428,7 +1425,7 @@ def show_status(db_path=None, cache_dir=None):
         print("  Not downloaded — run --pull first.")
 
     # ── pgeocode ZIP cache ─────────────────────────────────────────────────────
-    geo = _pgeocode_cache_info()
+    geo = _pgeocode_cache_info(db_path=db_path)
     print(f"\npgeocode ZIP cache:")
     if not geo["installed"]:
         print("  Not installed — install pgeocode to enable --zip radius search.")
