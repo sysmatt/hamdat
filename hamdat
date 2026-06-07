@@ -1239,7 +1239,7 @@ def pull(db_path=None, cache_dir=None, force=False, zips_folder=None, keep_db=No
         _rotate_backup(DB_PATH, keep_db)
 
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("PRAGMA synchronous=NORMAL")
 
     if zips_folder:
