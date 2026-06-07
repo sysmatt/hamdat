@@ -891,7 +891,7 @@ def lookup(callsign, db_path=None, show_history=False, show_full_history=False):
         sys.exit(f"Database not found: {db}\nRun --pull first.")
 
     call = callsign.strip().upper()
-    conn = sqlite3.connect(db)
+    conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
     conn.row_factory = sqlite3.Row
 
     if show_full_history:
@@ -992,7 +992,7 @@ def search_multi(callsearch=None, name=None, address=None, type_code=None,
     db = Path(db_path or DB_PATH)
     if not db.exists():
         sys.exit(f"Database not found: {db}\nRun --pull first.")
-    conn = sqlite3.connect(db)
+    conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
     conn.row_factory = sqlite3.Row
 
     if regex:
