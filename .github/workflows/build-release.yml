@@ -44,6 +44,10 @@ jobs:
         shell: bash
         run: |
           cp hamdat hamdat.py
+          python3 -c "
+content = open('hamdat.py').read()
+open('hamdat.py','w').write(content.replace('VERSION = \"dev\"', 'VERSION = \"${{ github.ref_name }}\"'))
+"
           pyinstaller --onefile --name hamdat hamdat.py
 
       - name: Rename for release

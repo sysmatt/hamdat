@@ -36,6 +36,8 @@ try:
 except ImportError:
     sys.exit("Install requests: pip install requests")
 
+VERSION = "dev"
+
 # FCC ULS full amateur radio database (weekly snapshot)
 # Directory: https://data.fcc.gov/download/pub/uls/complete/
 FCC_AMAT_URL = "https://data.fcc.gov/download/pub/uls/complete/l_amat.zip"
@@ -1009,7 +1011,7 @@ def _register_regexp(conn):
 def search_multi(callsearch=None, name=None, address=None, type_code=None,
                  zipcode=None, distance_miles=0,
                  grant_date=None, change_date=None, op_class=None,
-                 regex=False, fmt="table", outfile=None, db_path=None):
+                 limit=0, regex=False, fmt="table", outfile=None, db_path=None):
     """Search active operators, ANDing every criterion that is provided."""
     db = Path(db_path or DB_PATH)
     if not db.exists():
@@ -1139,7 +1141,8 @@ def search_multi(callsearch=None, name=None, address=None, type_code=None,
         params.extend(dp)
 
     extra = "  AND " + "\n  AND ".join(conds) if conds else ""
-    rows = conn.execute(_SQL_OPERATOR + extra, params).fetchall()
+    limit_clause = f"\nLIMIT {limit}" if limit > 0 else ""
+    rows = conn.execute(_SQL_OPERATOR + extra + limit_clause, params).fetchall()
     conn.close()
 
     seen    = set()
@@ -1479,6 +1482,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    parser.add_argument("--version", action="version", version=f"hamdat {VERSION}")
+
     # --- Data management ---
     parser.add_argument(
         "--status", action="store_true",
@@ -1578,6 +1583,10 @@ def main():
         ),
     )
     parser.add_argument(
+        "--limit", type=int, default=0, metavar="N",
+        help="Maximum number of search results to return; 0 = no limit (default: 0)",
+    )
+    parser.add_argument(
         "--regex", action="store_true",
         help="Treat --callsearch / --name / --address query as a Python regular expression",
     )
@@ -1647,7 +1656,7 @@ def main():
                      type_code=type_code, zipcode=args.zip,
                      distance_miles=args.radius_miles,
                      grant_date=args.grant_date, change_date=args.change_date,
-                     op_class=op_class,
+                     op_class=op_class, limit=args.limit,
                      regex=args.regex, fmt=fmt, outfile=args.file, db_path=args.db)
     elif args.call:
         lookup(args.call, db_path=args.db, show_history=args.history,

@@ -35,7 +35,7 @@ cp hamdat ~/bin/      # or anywhere on your PATH
 ## Usage
 
 ```
-hamdat [--pull] [--status] [--call CALLSIGN] [--callsearch QUERY] [--zip ZIPCODE] [--name QUERY] [--address QUERY] [--type TYPE [...]] [--class CLASS [...]] [--grant-date DATESPEC] [--change-date DATESPEC] [--keep-db [N]] [--keep-sources [N]] [options]
+hamdat [--pull] [--status] [--call CALLSIGN] [--callsearch QUERY] [--zip ZIPCODE] [--name QUERY] [--address QUERY] [--type TYPE [...]] [--class CLASS [...]] [--grant-date DATESPEC] [--change-date DATESPEC] [--limit N] [--keep-db [N]] [--keep-sources [N]] [--version] [options]
 ```
 
 ### Options
@@ -67,6 +67,7 @@ hamdat [--pull] [--status] [--call CALLSIGN] [--callsearch QUERY] [--zip ZIPCODE
 | `--change-date DATESPEC` | Filter by last action/change date (same format as `--grant-date`) |
 | `--zip ZIPCODE` | Find active operators near a ZIP code (see `--radius-miles`) |
 | `--radius-miles MILES` | Search radius for `--zip`; `0` = exact ZIP only (default: `0`) |
+| `--limit N` | Maximum number of search results to return; `0` = no limit (default: `0`) |
 | `--regex` | Treat `--callsearch` / `--name` / `--address` as a Python regular expression |
 
 **Output format** *(mutually exclusive; default is `--table`)*
@@ -85,6 +86,12 @@ hamdat [--pull] [--status] [--call CALLSIGN] [--callsearch QUERY] [--zip ZIPCODE
 | `--file PATH` | Output file for `--csv` / `--json` / `--html` (default: `~/.hamdat/results.{ext}`) |
 | `--db PATH` | SQLite database path (default: `~/.hamdat/hamdat.db`) |
 | `--cache-dir DIR` | Directory for downloaded zip files and ETags (default: `~/.hamdat/`) |
+
+**Misc**
+
+| Flag | Description |
+|---|---|
+| `--version` | Print the version and exit |
 
 ---
 
@@ -795,3 +802,31 @@ All files are stored under `~/.hamdat/` by default:
 
 ~/.hamdat/pgeocode/  pgeocode US postal code data (~1 MB, seeded by --pull)
 ```
+
+---
+
+## Troubleshooting
+
+**`Database not found: ~/.hamdat/hamdat.db — Run --pull first.`**
+
+The database has not been built yet, or `--db` points to a wrong path. Run `hamdat --pull` to download and build it.
+
+**`Install requests: pip install requests`**
+
+The `requests` package is missing. Install it with `pip install requests` (or `pip install requests pgeocode` to get both dependencies at once).
+
+**`Install pgeocode: pip install pgeocode`**
+
+The `pgeocode` package is only required for `--zip` radius searches. Install it with `pip install pgeocode`, then run `hamdat --pull` once to seed the ZIP code cache.
+
+**`Could not find coordinates for zip code: 12345`**
+
+The ZIP code was not found in the pgeocode database. Verify the ZIP code is a valid US postal code. If the pgeocode cache is missing or corrupt, run `hamdat --pull` to re-seed it.
+
+**`Cannot reach FCC servers and no cached data available. Check network.`**
+
+`--pull` could not contact the FCC and no local cache exists. Check your network connection. If you are in an offline environment, use `--pull --zips-folder` with pre-downloaded files (see [Offline Operations](#offline-operations)).
+
+**`No record found for callsign: W1XYZ`**
+
+The callsign does not exist in the local database. Confirm the spelling, then check whether the database is current with `hamdat --status`. If the license was granted recently, run `hamdat --pull` to apply the latest daily updates.
