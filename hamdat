@@ -1095,8 +1095,10 @@ def search_multi(callsearch=None, name=None, address=None, type_code=None,
             params.extend([f"%{address}%"] * len(addr_cols))
 
     if type_code:
-        conds.append("e.applicant_type_code = ?")
-        params.append(type_code)
+        codes = type_code if isinstance(type_code, list) else [type_code]
+        ph = ",".join("?" * len(codes))
+        conds.append(f"e.applicant_type_code IN ({ph})")
+        params.extend(codes)
 
     if op_class:
         codes = op_class if isinstance(op_class, list) else [op_class]
@@ -1146,7 +1148,9 @@ def search_multi(callsearch=None, name=None, address=None, type_code=None,
     if address:
         parts.append(f"address={address!r}")
     if type_code:
-        parts.append(f"type={_APPLICANT_TYPE_NAMES.get(type_code, type_code)!r}")
+        codes = type_code if isinstance(type_code, list) else [type_code]
+        label = "/".join(_APPLICANT_TYPE_NAMES.get(c, c) for c in codes)
+        parts.append(f"type={label!r}")
     if op_class:
         codes = op_class if isinstance(op_class, list) else [op_class]
         label = "/".join(_CLASS_NAMES.get(c, c) for c in codes)
@@ -1515,10 +1519,10 @@ def main():
         help="Search active operators by any part of mailing address (substring or --regex)",
     )
     parser.add_argument(
-        "--type", metavar="TYPE",
+        "--type", metavar="TYPE", nargs="+",
         help=(
             "Filter by entity type: individual, club, races, military, government "
-            "(or raw FCC code: I, B, R, M, G). Can be combined with --name, --address, --callsearch."
+            "(or raw FCC code: I, B, R, M, G). Multiple values: --type individual club"
         ),
     )
     parser.add_argument(
@@ -1597,8 +1601,7 @@ def main():
 
     type_code = None
     if args.type:
-        lower = args.type.lower()
-        type_code = _TYPE_CODES.get(lower, args.type.upper())
+        type_code = [_TYPE_CODES.get(t.lower(), t.upper()) for t in args.type]
 
     op_class = None
     if args.op_class:
