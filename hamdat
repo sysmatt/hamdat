@@ -539,6 +539,28 @@ def _resolve_class_codes(vals):
     return codes
 
 
+def _resolve_type_codes(vals):
+    """Resolve a list of entity type names or codes to a list of FCC applicant_type_code values."""
+    codes = []
+    for v in vals:
+        v = v.strip()
+        if not v:
+            continue
+        if v.upper() in _APPLICANT_TYPE_NAMES:
+            codes.append(v.upper())
+            continue
+        code = _TYPE_CODES.get(v.lower())
+        if code:
+            codes.append(code)
+            continue
+        sys.exit(
+            f"Unknown entity type: {v!r}\n"
+            f"Valid codes: {', '.join(_APPLICANT_TYPE_NAMES)}\n"
+            f"Valid names: {', '.join(_TYPE_CODES)}"
+        )
+    return codes
+
+
 # Field lists for tabular search results
 _SEARCH_FIELDS = [
     "call_sign", "name", "operator_class",
@@ -1260,8 +1282,10 @@ def pull(db_path=None, cache_dir=None, force=False, zips_folder=None, keep_db=No
         total = _load_full_zip(source_zip, conn)
 
         now = datetime.now(timezone.utc).isoformat()
+        snap_mtime = datetime.fromtimestamp(source_zip.stat().st_mtime, tz=timezone.utc)
         conn.execute("DELETE FROM _daily_applied")
         conn.execute("INSERT OR REPLACE INTO _meta VALUES (?, ?)", ("last_pull", now))
+        conn.execute("INSERT OR REPLACE INTO _meta VALUES (?, ?)", ("snapshot_date", snap_mtime.isoformat()))
         conn.commit()
         print(f"\nDone. {total:,} total records loaded into {DB_PATH}")
 
@@ -1374,7 +1398,7 @@ def show_status(db_path=None, cache_dir=None):
         size_mb = db.stat().st_size / 1_048_576
         print(f"  {'Size':<{lw}} {size_mb:.1f} MB")
 
-        conn = sqlite3.connect(db)
+        conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
         conn.row_factory = sqlite3.Row
 
         meta = {r["key"]: r["value"]
@@ -1499,7 +1523,7 @@ def main():
     )
     parser.add_argument(
         "--full-history", action="store_true",
-        help="With --call: show full formatted records for every past licensee, separated by 'Record X of Y' banners",
+        help="With --call: show full formatted records for every past licensee, separated by 'Record X of Y' banners. Takes precedence over --history if both are given.",
     )
     parser.add_argument(
         "--callsearch", metavar="QUERY",
@@ -1601,7 +1625,7 @@ def main():
 
     type_code = None
     if args.type:
-        type_code = [_TYPE_CODES.get(t.lower(), t.upper()) for t in args.type]
+        type_code = _resolve_type_codes(args.type)
 
     op_class = None
     if args.op_class:

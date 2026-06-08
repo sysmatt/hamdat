@@ -351,7 +351,7 @@ Appends a compact table showing all past licensees for the callsign after the no
 hamdat --call W2LV --full-history
 ```
 
-Shows the complete formatted operator profile for every licensee that has ever held the callsign, separated by `Record X of Y` banners, most-recent first. FCC action history is shown only for the most recent record.
+Shows the complete formatted operator profile for every licensee that has ever held the callsign, separated by `Record X of Y` banners, most-recent first. FCC action history is shown only for the most recent record. If both `--full-history` and `--history` are given, `--full-history` takes precedence and `--history` is ignored.
 
 ```
 ──────────────────────── Record 1 of 2 ─────────────────────────
@@ -709,7 +709,7 @@ hamdat --class T --grant-date -30
 hamdat --class T G --grant-date -60 --address "CT"
 
 # Extra class licenses granted within the last year
-hamdat --class E --grant-date >=2025-01-01
+hamdat --class E --grant-date since:2025-01-01
 ```
 
 ---
