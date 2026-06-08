@@ -35,7 +35,7 @@ cp hamdat ~/bin/      # or anywhere on your PATH
 ## Usage
 
 ```
-hamdat [--pull] [--status] [--call CALLSIGN] [--callsearch QUERY] [--zip ZIPCODE] [--name QUERY] [--address QUERY] [--type TYPE] [--class CLASS] [--grant-date DATESPEC] [--change-date DATESPEC] [--keep-db [N]] [--keep-sources [N]] [options]
+hamdat [--pull] [--status] [--call CALLSIGN] [--callsearch QUERY] [--zip ZIPCODE] [--name QUERY] [--address QUERY] [--type TYPE [...]] [--class CLASS [...]] [--grant-date DATESPEC] [--change-date DATESPEC] [--keep-db [N]] [--keep-sources [N]] [options]
 ```
 
 ### Options
@@ -61,7 +61,7 @@ hamdat [--pull] [--status] [--call CALLSIGN] [--callsearch QUERY] [--zip ZIPCODE
 | `--callsearch QUERY` | Search active operators by callsign (substring or `--regex`); returns a list |
 | `--name QUERY` | Search active operators by name (substring or `--regex`) |
 | `--address QUERY` | Search active operators by any part of mailing address (substring or `--regex`) |
-| `--type TYPE` | Filter by entity type: `individual`, `club`, `races`, `military`, `government` (or raw FCC code) |
+| `--type TYPE [...]` | Filter by entity type: `individual`, `club`, `races`, `military`, `government` (or raw FCC code). Multiple values allowed: `--type individual club` |
 | `--class CLASS [...]` | Filter by operator class: `T` `G` `E` `A` `N` `P` or full name. Multiple values allowed. |
 | `--grant-date DATESPEC` | Filter by license grant date (see [Date query language](#date-query-language)) |
 | `--change-date DATESPEC` | Filter by last action/change date (same format as `--grant-date`) |
@@ -240,7 +240,7 @@ Weekly snapshot cache: /home/user/.hamdat/l_amat.zip
 
 pgeocode ZIP cache:
   Cached                 2026-05-30 11:42 UTC
-  Cache path             /home/user/.cache/pgeocode/
+  Cache path             /home/user/.hamdat/pgeocode/
   Files                  3  (1,024 KB)
 ```
 
@@ -251,7 +251,7 @@ pgeocode ZIP cache:
    - Daily files: `https://data.fcc.gov/download/pub/uls/daily/l_am_sun.zip` … `l_am_sat.zip`
 2. Copy the zip files to a folder on the target machine.
 3. Run: `hamdat --pull --zips-folder /path/to/zips/`
-4. For pgeocode, copy `~/.cache/pgeocode/` from the connected machine to the same path on the target machine.
+4. For pgeocode, copy `~/.hamdat/pgeocode/` from the connected machine to the same path on the target machine.
 
 ---
 
@@ -450,6 +450,9 @@ hamdat --type club --name "Radio"            # clubs with "Radio" in the name
 hamdat --type club --callsearch "^W2" --regex   # W2 club callsigns
 hamdat --type individual --name "Smith" --address "CT"
 hamdat --type B                              # raw FCC code also works
+hamdat --type individual club                # individuals or clubs (OR logic)
+hamdat --type races military                 # RACES or military organizations
+hamdat --type individual club --grant-date -30   # new individuals or clubs in last 30 days
 ```
 
 ---
@@ -788,5 +791,5 @@ All files are stored under `~/.hamdat/` by default:
   results.json       Default output for --json
   results.html       Default output for --html
 
-~/.cache/pgeocode/   pgeocode US postal code data (~1 MB, seeded by --pull)
+~/.hamdat/pgeocode/  pgeocode US postal code data (~1 MB, seeded by --pull)
 ```
