@@ -162,6 +162,8 @@ Both flags follow the same rotation model: before anything is overwritten, a tim
 | `--keep-db [N]` | `hamdat.db` (~500 MB each) | `hamdat-20260606143022.db` |
 | `--keep-sources [N]` | `l_amat.zip` + each daily `l_am_*.zip` | `l_amat-20260606143022.zip` |
 
+> **Note:** Backup filename timestamps use local time, not UTC.
+
 **`--keep-db` — database rotation**
 
 ```

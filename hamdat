@@ -18,6 +18,7 @@ WARNING:  The SQLite database is used by external utilities and the
 
 import argparse
 import csv
+import html
 import io
 import json
 import re
@@ -775,8 +776,7 @@ def _class_or_type(op_class, applicant_type_code):
 
 def _row_to_result(row):
     """Convert a joined sqlite3.Row (header + entity + amateur) to a standard result dict."""
-    row_keys = row.keys()
-    zc = (row["zip5"] if "zip5" in row_keys else (row["zip_code"] or ""))[:5]
+    zc = (row["zip5"] or "")[:5]
     name = " ".join(
         p for p in [row["first_name"], row["mi"], row["last_name"]] if p
     ).strip() or (row["entity_name"] or "").strip()
@@ -849,7 +849,7 @@ def _write_json(results, fieldnames, outfile):
 
 def _write_html(results, fieldnames, outfile):
     def esc(s):
-        return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return html.escape(str(s or ""))
 
     lines = [
         "<!DOCTYPE html>",
@@ -1502,14 +1502,15 @@ def main():
         help="Before pulling, copy the database to a timestamped backup "
              "(e.g. hamdat-20260606143022.db) and keep only the N most recent copies. "
              "--keep-db alone keeps 1; --keep-db 0 purges all existing backups. "
-             "Note: each backup is ~500 MB.",
+             "Note: each backup is ~500 MB. Backup filenames use local time.",
     )
     parser.add_argument(
         "--keep-sources", metavar="N", nargs="?", const=1, default=None, type=int,
         help="Before downloading, copy each FCC zip (weekly snapshot and daily files) to a "
              "timestamped backup (e.g. l_amat-20260606143022.zip) and keep only the N most "
              "recent copies per file. --keep-sources alone keeps 1; --keep-sources 0 purges "
-             "all existing source backups. Only applies in remote (non --zips-folder) mode.",
+             "all existing source backups. Only applies in remote (non --zips-folder) mode. "
+             "Backup filenames use local time.",
     )
 
     # --- Queries ---
